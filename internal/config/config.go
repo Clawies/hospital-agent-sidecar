@@ -23,7 +23,7 @@ type Config struct {
 	// Agent runtime
 	StateDir     string // OpenClaw/Hermes home dir (default /home/themadme/.openclaw)
 	SystemdUnit  string // Systemd unit to watch (default openclaw-gateway.service)
-	GatewayURL   string // Gateway HTTP URL for health pings (default http://localhost:18789)
+	GatewayURL   string // Gateway HTTP URL for health pings (empty = skip, default http://localhost:18789)
 	GatewayPort  int    // Gateway port, used by kill-port repair (default 18789)
 	LLMHealthURL string // Optional: LLM proxy health URL (e.g. http://localhost:3456/v1/models)
 }

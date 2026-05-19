@@ -361,7 +361,18 @@ func (w *Watcher) healthCheckLoop(ctx context.Context) {
 	case <-time.After(graceAfterStart):
 	}
 
-	w.logger.Info("functional health checker started", "interval", healthCheckEvery, "gateway", w.cfg.GatewayURL)
+	checks := []string{}
+	if w.cfg.GatewayURL != "" {
+		checks = append(checks, "gateway="+w.cfg.GatewayURL)
+	}
+	if w.cfg.LLMHealthURL != "" {
+		checks = append(checks, "llm="+w.cfg.LLMHealthURL)
+	}
+	if len(checks) == 0 {
+		w.logger.Info("no health check URLs configured, health checker disabled")
+		return
+	}
+	w.logger.Info("functional health checker started", "interval", healthCheckEvery, "checks", checks)
 
 	ticker := time.NewTicker(healthCheckEvery)
 	defer ticker.Stop()
@@ -383,7 +394,18 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 		return
 	}
 
-	// Check 1: Gateway HTTP reachability
+	// Check 1: Gateway HTTP reachability (skip if not configured)
+	if w.cfg.GatewayURL != "" {
+		w.checkGatewayHealth(ctx)
+	}
+
+	// Check 2: LLM provider reachability (skip if not configured)
+	if w.cfg.LLMHealthURL != "" {
+		w.checkLLMHealth(ctx)
+	}
+}
+
+func (w *Watcher) checkGatewayHealth(ctx context.Context) {
 	gwErr := w.pingGateway()
 
 	w.mu.Lock()
@@ -411,11 +433,6 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 		if wasDegraded {
 			w.logger.Info("gateway recovered from degraded state")
 		}
-	}
-
-	// Check 2: LLM provider reachability (optional, only if configured)
-	if w.cfg.LLMHealthURL != "" {
-		w.checkLLMHealth(ctx)
 	}
 }
 
