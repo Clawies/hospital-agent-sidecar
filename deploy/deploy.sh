@@ -13,6 +13,7 @@ set -euo pipefail
 #   GATEWAY_PORT          (default: 18789)
 #   AGENT_PORT            (default: 18792)
 #   HEARTBEAT_INTERVAL    (default: 60)
+#   LLM_HEALTH_URL        (optional, e.g. http://localhost:3456/v1/models)
 
 VM=${1:-}
 ZONE=${2:-}
@@ -26,6 +27,7 @@ FRAMEWORK=${FRAMEWORK:-openclaw}
 GATEWAY_PORT=${GATEWAY_PORT:-18789}
 AGENT_PORT=${AGENT_PORT:-18792}
 HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-60}
+LLM_HEALTH_URL=${LLM_HEALTH_URL:-}
 
 if [[ -z "$VM" || -z "$ZONE" || -z "$INBOUND_TOKEN" || -z "$API_KEY" || -z "$HOSPITAL_URL" ]]; then
   echo "Usage: $0 <vm> <zone> <inbound-token> <api-key> <hospital-url>"
@@ -94,6 +96,7 @@ HOSPITAL_AGENT_GATEWAY_PORT=$GATEWAY_PORT
 HOSPITAL_AGENT_GATEWAY_URL=http://localhost:$GATEWAY_PORT
 HOSPITAL_AGENT_HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL
 HOSPITAL_AGENT_NAME=$VM
+$([ -n "$LLM_HEALTH_URL" ] && echo "HOSPITAL_AGENT_LLM_HEALTH_URL=$LLM_HEALTH_URL")
 EOF
     chmod 0600 \$HOME/.config/hospital-agent-sidecar/agent.env
 

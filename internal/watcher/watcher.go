@@ -70,6 +70,10 @@ type Watcher struct {
 	healthFailures int  // consecutive gateway HTTP failures
 	degradedSent   bool // already reported this degraded episode
 
+	// LLM health check state
+	llmFailures int  // consecutive LLM probe failures
+	llmAlertSent bool // already reported this LLM-down episode
+
 	// Channel for notifying heartbeat of crash events
 	CrashCh chan CrashEvent
 }
@@ -375,14 +379,15 @@ func (w *Watcher) healthCheckLoop(ctx context.Context) {
 func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 	// Only check when systemd says the unit is active
 	state := w.State()
-	if state.Status != StatusActive {
+	if state.Status != StatusActive && state.Status != StatusDegraded {
 		return
 	}
 
-	err := w.pingGateway()
+	// Check 1: Gateway HTTP reachability
+	gwErr := w.pingGateway()
 
 	w.mu.Lock()
-	if err != nil {
+	if gwErr != nil {
 		w.healthFailures++
 		failures := w.healthFailures
 		alreadySent := w.degradedSent
@@ -391,11 +396,11 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 		w.logger.Warn("gateway health check failed",
 			"failures", failures,
 			"threshold", unhealthyThreshold,
-			"err", err,
+			"err", gwErr,
 		)
 
 		if failures >= unhealthyThreshold && !alreadySent {
-			w.handleDegraded(ctx, err)
+			w.handleDegraded(ctx, gwErr)
 		}
 	} else {
 		wasDegraded := w.healthFailures >= unhealthyThreshold
@@ -406,6 +411,11 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 		if wasDegraded {
 			w.logger.Info("gateway recovered from degraded state")
 		}
+	}
+
+	// Check 2: LLM provider reachability (optional, only if configured)
+	if w.cfg.LLMHealthURL != "" {
+		w.checkLLMHealth(ctx)
 	}
 }
 
@@ -481,4 +491,111 @@ func (w *Watcher) handleDegraded(ctx context.Context, lastErr error) {
 	w.logger.Info("degraded state reported to hospital",
 		"restart_success", result.Success,
 	)
+}
+
+// --- LLM health check ---
+// Detects when the LLM provider (e.g., claude-max-api proxy) is down.
+// Gateway is alive and responding, but can't process any AI work.
+
+func (w *Watcher) checkLLMHealth(ctx context.Context) {
+	err := w.pingLLM()
+
+	w.mu.Lock()
+	if err != nil {
+		w.llmFailures++
+		failures := w.llmFailures
+		alreadySent := w.llmAlertSent
+		w.mu.Unlock()
+
+		w.logger.Warn("LLM health check failed",
+			"failures", failures,
+			"threshold", unhealthyThreshold,
+			"url", w.cfg.LLMHealthURL,
+			"err", err,
+		)
+
+		if failures >= unhealthyThreshold && !alreadySent {
+			w.handleLLMDown(ctx, err)
+		}
+	} else {
+		wasDown := w.llmFailures >= unhealthyThreshold
+		w.llmFailures = 0
+		w.llmAlertSent = false
+		w.mu.Unlock()
+
+		if wasDown {
+			w.logger.Info("LLM provider recovered")
+		}
+	}
+}
+
+func (w *Watcher) pingLLM() error {
+	client := &http.Client{Timeout: healthCheckTimeout}
+	resp, err := client.Get(w.cfg.LLMHealthURL)
+	if err != nil {
+		return fmt.Errorf("LLM unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 401/403 = auth issue (key expired), 429 = rate limited / credits exhausted
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return fmt.Errorf("LLM auth failed (HTTP %d): API key may be expired or invalid", resp.StatusCode)
+	}
+	if resp.StatusCode == 429 {
+		return fmt.Errorf("LLM rate limited (HTTP 429): credits may be exhausted")
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("LLM server error (HTTP %d)", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (w *Watcher) handleLLMDown(ctx context.Context, lastErr error) {
+	w.mu.Lock()
+	w.llmAlertSent = true
+	w.mu.Unlock()
+
+	w.logger.Warn("LLM provider is down: agent cannot process AI requests",
+		"llmURL", w.cfg.LLMHealthURL,
+		"consecutiveFailures", w.llmFailures,
+		"lastErr", lastErr,
+	)
+
+	// Don't restart -- the gateway is fine, it's the LLM that's broken.
+	// Just report to hospital for alerting + tracking.
+	cc := w.collector.CollectCrash(ctx)
+	l0diag := diagnosis.DiagnosisResult{
+		Layer:      "L0",
+		Summary:    fmt.Sprintf("LLM provider down: %s", lastErr),
+		Repairs:    []string{}, // no local fix for API key / provider issues
+		Confidence: 0.5,
+	}
+
+	now := time.Now()
+	crashEv := CrashEvent{
+		Context:     cc,
+		L0Diagnosis: l0diag,
+		LocalRepairs: []repair.Result{{
+			Action:  "none",
+			Success: false,
+			Output:  "LLM provider down -- no local repair available, needs human intervention",
+		}},
+		Timestamp: now,
+	}
+
+	w.mu.Lock()
+	w.state.LastCrashAt = &now
+	w.state.LastRepairs = []string{"llm-down(no-fix)"}
+	w.lastCrashEv = &crashEv
+	w.mu.Unlock()
+
+	// Push to hospital -- hospital will alert via Slack
+	select {
+	case w.CrashCh <- crashEv:
+	default:
+		w.logger.Warn("crash channel full, dropping LLM-down event")
+	}
+
+	w.logger.Info("LLM-down event reported to hospital for alerting")
 }
