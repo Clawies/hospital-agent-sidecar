@@ -1,0 +1,23 @@
+[Unit]
+Description=Hospital Sidecar - crash detection & auto-repair for AI agent gateways
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hospital-sidecar
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=%h/.config/hospital-agent-sidecar/agent.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.openclaw %h/.hermes /tmp/hospital-agent-disk-reserve /tmp/openclaw /tmp
+
+[Install]
+WantedBy=default.target

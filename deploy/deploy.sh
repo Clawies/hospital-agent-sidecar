@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy hospital-agent-sidecar to a target VM via gcloud IAP tunnel.
+# Deploy hospital-sidecar to a target VM via gcloud IAP tunnel.
 #
 # Usage:
 #   ./deploy/deploy.sh <vm-name> <zone> <inbound-token> <api-key> <hospital-url>
@@ -11,10 +11,10 @@ set -euo pipefail
 #   SYSTEMD_UNIT          (default: openclaw-gateway.service)
 #   FRAMEWORK             (default: openclaw)
 #   GATEWAY_PORT          (default: 18789)
-#   AGENT_PORT            (default: 18792)
+#   AGENT_PORT            (default: 18793)
 #   HEARTBEAT_INTERVAL    (default: 60)
-#   LLM_HEALTH_URL        (optional, auto-detected from openclaw.json for openclaw framework)
-#   LLM_HEALTH_AUTH       (optional, auto-detected from openclaw.json for openclaw framework)
+#   LLM_HEALTH_URL        (optional, auto-detected from openclaw.json by the sidecar)
+#   LLM_HEALTH_AUTH       (optional, auto-detected from openclaw.json by the sidecar)
 #   SKIP_BUILD            (set to "true" to skip cross-compile, used by deploy-all.sh)
 
 VM=${1:-}
@@ -46,8 +46,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BIN="$PROJECT_DIR/bin/hospital-agent-sidecar-linux-amd64"
-UNIT="$SCRIPT_DIR/hospital-agent-sidecar.service"
+BIN="$PROJECT_DIR/bin/hospital-sidecar-linux-amd64"
+UNIT="$PROJECT_DIR/internal/setup/hospital-sidecar.service"
 
 if [[ "${SKIP_BUILD:-}" != "true" ]]; then
   echo "=== Building linux/amd64 ==="
@@ -78,13 +78,15 @@ gcloud compute ssh \
     # Create directories
     mkdir -p \$HOME/.local/bin \$HOME/.config/systemd/user \$HOME/.config/hospital-agent-sidecar
 
-    # Install binary
-    install -m 0755 /tmp/hospital-agent-sidecar-linux-amd64 \$HOME/.local/bin/hospital-agent-sidecar
+    # Install binary (new name: hospital-sidecar)
+    install -m 0755 /tmp/hospital-sidecar-linux-amd64 \$HOME/.local/bin/hospital-sidecar
 
-    # Install systemd unit
-    install -m 0644 /tmp/hospital-agent-sidecar.service \$HOME/.config/systemd/user/hospital-agent-sidecar.service
+    # Install systemd unit (new name: hospital-sidecar.service)
+    install -m 0644 /tmp/hospital-sidecar.service \$HOME/.config/systemd/user/hospital-sidecar.service
 
-    # Stop old unit if it exists (migration from hospital-agent -> hospital-agent-sidecar)
+    # Stop old units from previous versions
+    systemctl --user stop hospital-agent-sidecar.service 2>/dev/null || true
+    systemctl --user disable hospital-agent-sidecar.service 2>/dev/null || true
     systemctl --user stop hospital-agent.service 2>/dev/null || true
     systemctl --user disable hospital-agent.service 2>/dev/null || true
 
@@ -111,13 +113,13 @@ EOF
 
     # Reload and restart
     systemctl --user daemon-reload
-    systemctl --user enable hospital-agent-sidecar.service
-    systemctl --user restart hospital-agent-sidecar.service
+    systemctl --user enable hospital-sidecar.service
+    systemctl --user restart hospital-sidecar.service
 
     # Wait and verify
     sleep 2
     echo '--- Status ---'
-    systemctl --user status hospital-agent-sidecar.service --no-pager || true
+    systemctl --user status hospital-sidecar.service --no-pager || true
     echo ''
     echo '--- Healthz ---'
     curl -sS --max-time 3 http://127.0.0.1:$AGENT_PORT/healthz && echo

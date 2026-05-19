@@ -76,6 +76,16 @@ T+65s  Hospital AI diagnosis received (via Claude API on server side)
 
 ## Installation
 
+### npm (recommended for external users)
+
+```bash
+npx @agent-hospital/sidecar setup \
+  --api-key YOUR_API_KEY \
+  --hospital-url https://api.agent-hospital.ai
+```
+
+The sidecar auto-detects your framework (OpenClaw/Hermes), LLM provider, and gateway config.
+
 ### From source
 
 ```bash
@@ -84,68 +94,34 @@ cd hospital-agent-sidecar
 make build-linux    # cross-compile for linux/amd64
 ```
 
-### Deploy to a VM
+### Self-install on a VM
 
-The deploy script handles everything: build, SCP, systemd install, and verification.
+Copy the binary to a VM and use the built-in `setup` command:
+
+```bash
+scp bin/hospital-sidecar-linux-amd64 user@vm:/tmp/hospital-sidecar
+ssh user@vm "chmod +x /tmp/hospital-sidecar && /tmp/hospital-sidecar setup \
+  --api-key ah_xxx --hospital-url http://hospital-ip:4000"
+```
+
+### Deploy script (internal fleet management)
 
 ```bash
 ./deploy/deploy.sh <vm-name> <zone> <inbound-token> <api-key> <hospital-url>
+
+# Mass deploy to all VMs:
+./deploy/deploy-all.sh <hospital-url>
 ```
 
-**OpenClaw example:**
-```bash
-./deploy/deploy.sh internal-automations asia-south2-a \
-  $(openssl rand -hex 16) \
-  ah_$(openssl rand -hex 16) \
-  http://10.160.0.24:4000
+## CLI Commands
+
 ```
-
-**Hermes example:**
-```bash
-FRAMEWORK=hermes \
-STATE_DIR=/home/themadme/.hermes \
-SYSTEMD_UNIT=hermes-gateway.service \
-  ./deploy/deploy.sh hermes-design asia-south1-b \
-    $(openssl rand -hex 16) \
-    ah_$(openssl rand -hex 16) \
-    http://10.160.0.24:4000
+hospital-sidecar              Run the sidecar server (used by systemd)
+hospital-sidecar setup        Install and start as a systemd service
+hospital-sidecar status       Check if the sidecar is running
+hospital-sidecar uninstall    Stop and remove the sidecar
+hospital-sidecar version      Print version
 ```
-
-### Manual install
-
-1. Copy the binary to the target VM:
-   ```bash
-   scp bin/hospital-agent-sidecar-linux-amd64 user@vm:~/.local/bin/hospital-agent-sidecar
-   chmod +x ~/.local/bin/hospital-agent-sidecar
-   ```
-
-2. Create the env file at `~/.config/hospital-agent-sidecar/agent.env`:
-   ```
-   HOSPITAL_AGENT_PORT=18793
-   HOSPITAL_AGENT_INBOUND_TOKEN=<generate with: openssl rand -hex 16>
-   HOSPITAL_AGENT_API_KEY=<from hospital server>
-   HOSPITAL_AGENT_HOSPITAL_URL=http://<hospital-ip>:4000
-   HOSPITAL_AGENT_STATE_DIR=/home/user/.openclaw
-   HOSPITAL_AGENT_SYSTEMD_UNIT=openclaw-gateway.service
-   HOSPITAL_AGENT_FRAMEWORK=openclaw
-   HOSPITAL_AGENT_GATEWAY_PORT=18789
-   HOSPITAL_AGENT_GATEWAY_URL=http://localhost:18789
-   HOSPITAL_AGENT_HEARTBEAT_INTERVAL=60
-   HOSPITAL_AGENT_NAME=my-agent-vm
-   ```
-
-3. Install the systemd unit:
-   ```bash
-   cp deploy/hospital-agent-sidecar.service ~/.config/systemd/user/
-   systemctl --user daemon-reload
-   systemctl --user enable --now hospital-agent-sidecar.service
-   ```
-
-4. Verify:
-   ```bash
-   systemctl --user status hospital-agent-sidecar
-   curl http://localhost:18793/healthz
-   ```
 
 ## Auth
 

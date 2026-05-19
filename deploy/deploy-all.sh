@@ -85,7 +85,7 @@ for entry in "${TARGETS[@]}"; do
       --tunnel-through-iap --quiet \
       --zone="$ZONE" \
       "themadme@${VM}" \
-      --command="systemctl --user is-active hospital-agent-sidecar.service 2>/dev/null || echo inactive" \
+      --command="systemctl --user is-active hospital-sidecar.service 2>/dev/null || systemctl --user is-active hospital-agent-sidecar.service 2>/dev/null || echo inactive" \
       2>/dev/null || echo "ssh-failed")
 
     STATUS=$(echo "$STATUS" | tail -1 | tr -d '[:space:]')
