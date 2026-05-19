@@ -11,7 +11,7 @@ Zero external Go dependencies. Single static binary (~6MB).
  +-------------------------------------------------------------------------------------------+
  |                                                                                           |
  |   +---------------------+         +--------------------------------------------------+   |
- |   | openclaw-gateway     |         | hospital-agent-sidecar (Go, port 18792, systemd)  |   |
+ |   | openclaw-gateway     |         | hospital-agent-sidecar (Go, port 18793, systemd)  |   |
  |   | or hermes-gateway    |         |                                                  |   |
  |   | (systemd, port 18789)|         |  Watcher          polls systemctl every 5s       |   |
  |   |                      |<--------|  Collector         journalctl, dmesg, disk, mem  |   |
@@ -121,7 +121,7 @@ SYSTEMD_UNIT=hermes-gateway.service \
 
 2. Create the env file at `~/.config/hospital-agent-sidecar/agent.env`:
    ```
-   HOSPITAL_AGENT_PORT=18792
+   HOSPITAL_AGENT_PORT=18793
    HOSPITAL_AGENT_INBOUND_TOKEN=<generate with: openssl rand -hex 16>
    HOSPITAL_AGENT_API_KEY=<from hospital server>
    HOSPITAL_AGENT_HOSPITAL_URL=http://<hospital-ip>:4000
@@ -144,7 +144,7 @@ SYSTEMD_UNIT=hermes-gateway.service \
 4. Verify:
    ```bash
    systemctl --user status hospital-agent-sidecar
-   curl http://localhost:18792/healthz
+   curl http://localhost:18793/healthz
    ```
 
 ## Auth
@@ -171,7 +171,7 @@ Each action has 60s cooldown and max 3 attempts per incident.
 
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
-| `HOSPITAL_AGENT_PORT` | `18792` | no | Sidecar listen port |
+| `HOSPITAL_AGENT_PORT` | `18793` | no | Sidecar listen port |
 | `HOSPITAL_AGENT_INBOUND_TOKEN` | - | yes | Bearer token for inbound requests |
 | `HOSPITAL_AGENT_API_KEY` | - | yes | x-api-key for hospital server |
 | `HOSPITAL_AGENT_HOSPITAL_URL` | - | yes | Hospital server base URL |

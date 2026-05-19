@@ -40,10 +40,12 @@ func DetectLLM(stateDir, framework string) (*LLMDetection, error) {
 	// Extract env section for variable resolution
 	envMap, _ := getNestedMap(root, "env")
 
-	// Find primary model: agents.defaults.model.primary
-	primaryModel, ok := getNestedString(root, "agents", "defaults", "model", "primary")
-	if !ok || primaryModel == "" {
-		return nil, fmt.Errorf("agents.defaults.model.primary not found in %s", configPath)
+	// Find primary model. OpenClaw supports two formats:
+	//   agents.defaults.model: "openrouter/z-ai/glm-4.7"          (string)
+	//   agents.defaults.model: { primary: "openrouter/z-ai/glm-4.7" }  (object)
+	primaryModel := findPrimaryModel(root)
+	if primaryModel == "" {
+		return nil, fmt.Errorf("agents.defaults.model not found in %s", configPath)
 	}
 
 	// Split provider from model: "openrouter/z-ai/glm-4.7" -> provider="openrouter"
@@ -53,18 +55,23 @@ func DetectLLM(stateDir, framework string) (*LLMDetection, error) {
 	}
 
 	// Look up provider config: models.providers.<provider>
+	// If not found, use well-known defaults for common providers
 	providerCfg, ok := getNestedMap(root, "models", "providers", providerName)
-	if !ok {
-		return nil, fmt.Errorf("provider %q not found in models.providers", providerName)
+	var baseURL string
+	if ok {
+		baseURL, _ = providerCfg["baseUrl"].(string)
 	}
-
-	// Get baseUrl
-	baseURL, ok := providerCfg["baseUrl"].(string)
-	if !ok || baseURL == "" {
-		return nil, fmt.Errorf("provider %q has no baseUrl", providerName)
+	if baseURL == "" {
+		baseURL = wellKnownBaseURL(providerName)
+	}
+	if baseURL == "" {
+		return nil, fmt.Errorf("provider %q: no baseUrl in models.providers and no well-known default", providerName)
 	}
 
 	// Get apiKey -- may be absent, empty, "${VAR}", "not-needed", or a raw key
+	if providerCfg == nil {
+		providerCfg = map[string]any{} // empty map for resolveAPIKey
+	}
 	apiKey := resolveAPIKey(providerCfg, envMap, providerName)
 
 	// Construct health URL: baseUrl + "/models"
@@ -78,6 +85,30 @@ func DetectLLM(stateDir, framework string) (*LLMDetection, error) {
 		AuthHeader: authHeader,
 		Provider:   providerName,
 	}, nil
+}
+
+// findPrimaryModel extracts the primary model string from openclaw.json.
+// Handles both formats: string directly or object with "primary" field.
+func findPrimaryModel(root map[string]any) string {
+	defaults, ok := getNestedMap(root, "agents", "defaults")
+	if !ok {
+		return ""
+	}
+	model, exists := defaults["model"]
+	if !exists {
+		return ""
+	}
+	// Case 1: model is a string directly
+	if s, ok := model.(string); ok && s != "" {
+		return s
+	}
+	// Case 2: model is an object with "primary" field
+	if m, ok := model.(map[string]any); ok {
+		if primary, ok := m["primary"].(string); ok {
+			return primary
+		}
+	}
+	return ""
 }
 
 // splitProvider splits "openrouter/z-ai/glm-4.7" into ("openrouter", "z-ai/glm-4.7").
@@ -128,6 +159,21 @@ func resolveAPIKey(providerCfg, envMap map[string]any, providerName string) stri
 	}
 
 	return ""
+}
+
+// wellKnownBaseURL returns the default base URL for common providers.
+// Used when models.providers.<name> is absent (OpenClaw uses built-in defaults).
+func wellKnownBaseURL(provider string) string {
+	switch provider {
+	case "openrouter":
+		return "https://openrouter.ai/api/v1"
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "anthropic":
+		return "https://api.anthropic.com/v1"
+	default:
+		return ""
+	}
 }
 
 // wellKnownAPIKeyVar returns the conventional env var name for a provider.

@@ -9,7 +9,7 @@ import (
 
 type Config struct {
 	// Server
-	Port          string // Listen port (default 18791)
+	Port          string // Listen port (default 18793)
 	InboundToken  string // Bearer token for inbound requests from hospital (required)
 
 	// Agent identity
@@ -32,7 +32,7 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:              envOr("HOSPITAL_AGENT_PORT", "18792"),
+		Port:              envOr("HOSPITAL_AGENT_PORT", "18793"),
 		InboundToken:      os.Getenv("HOSPITAL_AGENT_INBOUND_TOKEN"),
 		APIKey:            os.Getenv("HOSPITAL_AGENT_API_KEY"),
 		Framework:         envOr("HOSPITAL_AGENT_FRAMEWORK", "openclaw"),
