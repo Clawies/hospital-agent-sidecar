@@ -39,7 +39,7 @@ func Load() (*Config, error) {
 		HeartbeatInterval: envInt("HOSPITAL_AGENT_HEARTBEAT_INTERVAL", 60),
 		StateDir:          envOr("HOSPITAL_AGENT_STATE_DIR", "/home/themadme/.openclaw"),
 		SystemdUnit:       envOr("HOSPITAL_AGENT_SYSTEMD_UNIT", "openclaw-gateway.service"),
-		GatewayURL:        envOr("HOSPITAL_AGENT_GATEWAY_URL", "http://localhost:18789"),
+		GatewayURL:        os.Getenv("HOSPITAL_AGENT_GATEWAY_URL"), // empty = skip gateway health check
 		GatewayPort:       envInt("HOSPITAL_AGENT_GATEWAY_PORT", 18789),
 		LLMHealthURL:      os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_URL"), // optional, empty = skip LLM check
 	}
