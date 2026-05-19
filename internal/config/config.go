@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 )
@@ -44,6 +45,18 @@ func Load() (*Config, error) {
 		GatewayPort:       envInt("HOSPITAL_AGENT_GATEWAY_PORT", 18789),
 		LLMHealthURL:      os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_URL"),  // optional, empty = skip LLM check
 		LLMHealthAuth:     os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_AUTH"), // optional auth header for LLM check
+	}
+
+	// Auto-detect LLM config from openclaw.json if not manually overridden
+	if cfg.LLMHealthURL == "" && cfg.Framework == "openclaw" {
+		det, err := DetectLLM(cfg.StateDir, cfg.Framework)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: LLM auto-detect: %v\n", err)
+		} else {
+			cfg.LLMHealthURL = det.HealthURL
+			cfg.LLMHealthAuth = det.AuthHeader
+			fmt.Fprintf(os.Stderr, "INFO: Auto-detected LLM: %s -> %s\n", det.Provider, det.HealthURL)
+		}
 	}
 
 	if cfg.InboundToken == "" {

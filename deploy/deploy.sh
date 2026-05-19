@@ -13,8 +13,9 @@ set -euo pipefail
 #   GATEWAY_PORT          (default: 18789)
 #   AGENT_PORT            (default: 18792)
 #   HEARTBEAT_INTERVAL    (default: 60)
-#   LLM_HEALTH_URL        (optional, e.g. http://localhost:3456/v1/models)
-#   LLM_HEALTH_AUTH       (optional, e.g. "Bearer sk-or-...", "x-api-key sk-ant-...")
+#   LLM_HEALTH_URL        (optional, auto-detected from openclaw.json for openclaw framework)
+#   LLM_HEALTH_AUTH       (optional, auto-detected from openclaw.json for openclaw framework)
+#   SKIP_BUILD            (set to "true" to skip cross-compile, used by deploy-all.sh)
 
 VM=${1:-}
 ZONE=${2:-}
@@ -48,9 +49,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BIN="$PROJECT_DIR/bin/hospital-agent-sidecar-linux-amd64"
 UNIT="$SCRIPT_DIR/hospital-agent-sidecar.service"
 
-echo "=== Building linux/amd64 ==="
-cd "$PROJECT_DIR"
-make build-linux
+if [[ "${SKIP_BUILD:-}" != "true" ]]; then
+  echo "=== Building linux/amd64 ==="
+  cd "$PROJECT_DIR"
+  make build-linux
+fi
 
 if [[ ! -f "$BIN" ]]; then
   echo "ERROR: Binary not found at $BIN"

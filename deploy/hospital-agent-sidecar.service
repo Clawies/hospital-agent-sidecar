@@ -17,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.openclaw /tmp/hospital-agent-disk-reserve /tmp/openclaw /tmp
+ReadWritePaths=%h/.openclaw %h/.hermes /tmp/hospital-agent-disk-reserve /tmp/openclaw /tmp
 
 [Install]
 WantedBy=default.target
