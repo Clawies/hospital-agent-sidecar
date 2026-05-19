@@ -1,0 +1,23 @@
+[Unit]
+Description=Hospital Agent - crash watcher and heartbeat sidecar for Agent Hospital
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hospital-agent
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=%h/.config/hospital-agent/agent.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.openclaw /tmp/hospital-agent-disk-reserve /tmp/openclaw /tmp
+
+[Install]
+WantedBy=default.target

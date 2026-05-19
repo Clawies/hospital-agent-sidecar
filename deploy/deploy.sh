@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deploy hospital-agent to a target VM via gcloud IAP tunnel.
+#
+# Usage:
+#   ./deploy/deploy.sh <vm-name> <zone> <inbound-token> <api-key> <hospital-url>
+#
+# Environment overrides:
+#   STATE_DIR             (default: /home/themadme/.openclaw)
+#   SYSTEMD_UNIT          (default: openclaw-gateway.service)
+#   FRAMEWORK             (default: openclaw)
+#   GATEWAY_PORT          (default: 18789)
+#   AGENT_PORT            (default: 18791)
+#   LOCAL_AI_URL          (default: http://127.0.0.1:3456/v1)
+#   LOCAL_AI_MODEL        (default: claude-sonnet-4)
+#   HEARTBEAT_INTERVAL    (default: 60)
+
+VM=${1:-}
+ZONE=${2:-}
+INBOUND_TOKEN=${3:-}
+API_KEY=${4:-}
+HOSPITAL_URL=${5:-}
+
+STATE_DIR=${STATE_DIR:-/home/themadme/.openclaw}
+SYSTEMD_UNIT=${SYSTEMD_UNIT:-openclaw-gateway.service}
+FRAMEWORK=${FRAMEWORK:-openclaw}
+GATEWAY_PORT=${GATEWAY_PORT:-18789}
+AGENT_PORT=${AGENT_PORT:-18792}
+LOCAL_AI_URL=${LOCAL_AI_URL:-http://127.0.0.1:3456/v1}
+LOCAL_AI_MODEL=${LOCAL_AI_MODEL:-claude-sonnet-4}
+HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-60}
+
+if [[ -z "$VM" || -z "$ZONE" || -z "$INBOUND_TOKEN" || -z "$API_KEY" || -z "$HOSPITAL_URL" ]]; then
+  echo "Usage: $0 <vm> <zone> <inbound-token> <api-key> <hospital-url>"
+  echo ""
+  echo "Example:"
+  echo "  $0 internal-automations asia-south2-a tok123 ah_abc123 https://api.agent-hospital.ai"
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+BIN="$PROJECT_DIR/bin/hospital-agent-linux-amd64"
+UNIT="$SCRIPT_DIR/hospital-agent.service"
+
+echo "=== Building linux/amd64 ==="
+cd "$PROJECT_DIR"
+make build-linux
+
+if [[ ! -f "$BIN" ]]; then
+  echo "ERROR: Binary not found at $BIN"
+  exit 1
+fi
+
+echo "=== Copying to $VM ($ZONE) ==="
+gcloud compute scp \
+  --tunnel-through-iap \
+  --zone="$ZONE" \
+  "$BIN" "$UNIT" \
+  "themadme@${VM}:/tmp/"
+
+echo "=== Installing on $VM ==="
+gcloud compute ssh \
+  --tunnel-through-iap \
+  --zone="$ZONE" \
+  "themadme@${VM}" \
+  --command="
+    set -e
+
+    # Create directories
+    mkdir -p \$HOME/.local/bin \$HOME/.config/systemd/user \$HOME/.config/hospital-agent
+
+    # Install binary
+    install -m 0755 /tmp/hospital-agent-linux-amd64 \$HOME/.local/bin/hospital-agent
+
+    # Install systemd unit
+    install -m 0644 /tmp/hospital-agent.service \$HOME/.config/systemd/user/hospital-agent.service
+
+    # Write env file
+    cat > \$HOME/.config/hospital-agent/agent.env <<EOF
+HOSPITAL_AGENT_PORT=$AGENT_PORT
+HOSPITAL_AGENT_INBOUND_TOKEN=$INBOUND_TOKEN
+HOSPITAL_AGENT_API_KEY=$API_KEY
+HOSPITAL_AGENT_HOSPITAL_URL=$HOSPITAL_URL
+HOSPITAL_AGENT_STATE_DIR=$STATE_DIR
+HOSPITAL_AGENT_SYSTEMD_UNIT=$SYSTEMD_UNIT
+HOSPITAL_AGENT_FRAMEWORK=$FRAMEWORK
+HOSPITAL_AGENT_GATEWAY_PORT=$GATEWAY_PORT
+HOSPITAL_AGENT_GATEWAY_URL=http://localhost:$GATEWAY_PORT
+HOSPITAL_AGENT_LOCAL_AI_URL=$LOCAL_AI_URL
+HOSPITAL_AGENT_LOCAL_AI_MODEL=$LOCAL_AI_MODEL
+HOSPITAL_AGENT_HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL
+HOSPITAL_AGENT_NAME=$VM
+EOF
+    chmod 0600 \$HOME/.config/hospital-agent/agent.env
+
+    # Enable linger (keep user services alive after logout)
+    loginctl enable-linger themadme 2>/dev/null || true
+
+    # Reload and restart
+    systemctl --user daemon-reload
+    systemctl --user enable hospital-agent.service
+    systemctl --user restart hospital-agent.service
+
+    # Wait and verify
+    sleep 2
+    echo '--- Status ---'
+    systemctl --user status hospital-agent.service --no-pager || true
+    echo ''
+    echo '--- Healthz ---'
+    curl -sS --max-time 3 http://127.0.0.1:$AGENT_PORT/healthz && echo
+  "
+
+echo "=== Deploy complete ==="
