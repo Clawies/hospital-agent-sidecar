@@ -167,7 +167,9 @@ func (h *Heartbeat) pushCrashReport(ctx context.Context, ev watcher.CrashEvent) 
 
 	h.logger.Info("pushing crash report to hospital for AI diagnosis")
 
-	resp, err := h.postJSON(ctx, "/api/v1/heartbeat/crash", payload)
+	// Use a longer timeout for crash reports -- hospital runs AI diagnosis (~30-45s)
+	crashClient := &http.Client{Timeout: 90 * time.Second}
+	resp, err := h.postJSONWith(ctx, crashClient, "/api/v1/heartbeat/crash", payload)
 	if err != nil {
 		h.logger.Warn("crash report push failed", "err", err)
 		return
@@ -244,6 +246,10 @@ func (h *Heartbeat) pushRepairResults(ctx context.Context, results []repair.Resu
 // --- HTTP helper ---
 
 func (h *Heartbeat) postJSON(ctx context.Context, path string, body any) ([]byte, error) {
+	return h.postJSONWith(ctx, h.client, path, body)
+}
+
+func (h *Heartbeat) postJSONWith(ctx context.Context, client *http.Client, path string, body any) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
@@ -257,7 +263,7 @@ func (h *Heartbeat) postJSON(ctx context.Context, path string, body any) ([]byte
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", h.cfg.APIKey)
 
-	resp, err := h.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
