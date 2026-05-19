@@ -3,7 +3,7 @@ package diagnosis
 import (
 	"strings"
 
-	"github.com/clawies/hospital-agent/internal/collector"
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
 )
 
 // DiagnosisResult holds the output of any diagnosis layer.

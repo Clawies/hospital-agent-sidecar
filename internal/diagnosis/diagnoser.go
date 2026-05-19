@@ -3,8 +3,8 @@ package diagnosis
 import (
 	"log/slog"
 
-	"github.com/clawies/hospital-agent/internal/collector"
-	"github.com/clawies/hospital-agent/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
 )
 
 // Diagnoser runs L0 pattern matching for immediate crash diagnosis.

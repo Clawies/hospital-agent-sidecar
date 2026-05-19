@@ -7,10 +7,10 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/clawies/hospital-agent/internal/collector"
-	"github.com/clawies/hospital-agent/internal/config"
-	"github.com/clawies/hospital-agent/internal/repair"
-	"github.com/clawies/hospital-agent/internal/watcher"
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/repair"
+	"github.com/clawies/hospital-agent-sidecar/internal/watcher"
 )
 
 type Handlers struct {

@@ -1,5 +1,5 @@
-BIN := bin/hospital-agent
-LINUX_BIN := bin/hospital-agent-linux-amd64
+BIN := bin/hospital-agent-sidecar
+LINUX_BIN := bin/hospital-agent-sidecar-linux-amd64
 PKG := ./cmd/hospital-agent
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)

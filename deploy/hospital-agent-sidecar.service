@@ -1,16 +1,16 @@
 [Unit]
-Description=Hospital Agent - crash watcher and heartbeat sidecar for Agent Hospital
+Description=Hospital Agent Sidecar - crash watcher and heartbeat for Agent Hospital
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/hospital-agent
+ExecStart=%h/.local/bin/hospital-agent-sidecar
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-EnvironmentFile=%h/.config/hospital-agent/agent.env
+EnvironmentFile=%h/.config/hospital-agent-sidecar/agent.env
 
 # Hardening
 NoNewPrivileges=true

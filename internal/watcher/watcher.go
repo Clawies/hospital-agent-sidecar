@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clawies/hospital-agent/internal/collector"
-	"github.com/clawies/hospital-agent/internal/config"
-	"github.com/clawies/hospital-agent/internal/diagnosis"
-	"github.com/clawies/hospital-agent/internal/repair"
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/diagnosis"
+	"github.com/clawies/hospital-agent-sidecar/internal/repair"
 )
 
 const (

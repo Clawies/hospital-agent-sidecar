@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/clawies/hospital-agent/internal/config"
-	"github.com/clawies/hospital-agent/internal/server"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/server"
 )
 
 var version = "dev"

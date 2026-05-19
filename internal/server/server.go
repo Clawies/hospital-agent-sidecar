@@ -8,14 +8,14 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/clawies/hospital-agent/internal/auth"
-	"github.com/clawies/hospital-agent/internal/collector"
-	"github.com/clawies/hospital-agent/internal/config"
-	"github.com/clawies/hospital-agent/internal/diagnosis"
-	"github.com/clawies/hospital-agent/internal/handlers"
-	"github.com/clawies/hospital-agent/internal/heartbeat"
-	"github.com/clawies/hospital-agent/internal/repair"
-	"github.com/clawies/hospital-agent/internal/watcher"
+	"github.com/clawies/hospital-agent-sidecar/internal/auth"
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/diagnosis"
+	"github.com/clawies/hospital-agent-sidecar/internal/handlers"
+	"github.com/clawies/hospital-agent-sidecar/internal/heartbeat"
+	"github.com/clawies/hospital-agent-sidecar/internal/repair"
+	"github.com/clawies/hospital-agent-sidecar/internal/watcher"
 )
 
 func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version string) error {

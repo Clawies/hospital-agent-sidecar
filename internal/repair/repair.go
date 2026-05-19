@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clawies/hospital-agent/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
 )
 
 const (

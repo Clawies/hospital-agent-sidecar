@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy hospital-agent to a target VM via gcloud IAP tunnel.
+# Deploy hospital-agent-sidecar to a target VM via gcloud IAP tunnel.
 #
 # Usage:
 #   ./deploy/deploy.sh <vm-name> <zone> <inbound-token> <api-key> <hospital-url>
@@ -31,14 +31,18 @@ if [[ -z "$VM" || -z "$ZONE" || -z "$INBOUND_TOKEN" || -z "$API_KEY" || -z "$HOS
   echo "Usage: $0 <vm> <zone> <inbound-token> <api-key> <hospital-url>"
   echo ""
   echo "Example:"
-  echo "  $0 internal-automations asia-south2-a tok123 ah_abc123 https://api.agent-hospital.ai"
+  echo "  $0 internal-automations asia-south2-a tok123 ah_abc123 http://10.160.0.24:4000"
+  echo ""
+  echo "Hermes example:"
+  echo "  FRAMEWORK=hermes STATE_DIR=/home/themadme/.hermes SYSTEMD_UNIT=hermes-gateway.service \\"
+  echo "    $0 hermes-design asia-south1-b tok456 ah_def456 http://10.160.0.24:4000"
   exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BIN="$PROJECT_DIR/bin/hospital-agent-linux-amd64"
-UNIT="$SCRIPT_DIR/hospital-agent.service"
+BIN="$PROJECT_DIR/bin/hospital-agent-sidecar-linux-amd64"
+UNIT="$SCRIPT_DIR/hospital-agent-sidecar.service"
 
 echo "=== Building linux/amd64 ==="
 cd "$PROJECT_DIR"
@@ -65,16 +69,20 @@ gcloud compute ssh \
     set -e
 
     # Create directories
-    mkdir -p \$HOME/.local/bin \$HOME/.config/systemd/user \$HOME/.config/hospital-agent
+    mkdir -p \$HOME/.local/bin \$HOME/.config/systemd/user \$HOME/.config/hospital-agent-sidecar
 
     # Install binary
-    install -m 0755 /tmp/hospital-agent-linux-amd64 \$HOME/.local/bin/hospital-agent
+    install -m 0755 /tmp/hospital-agent-sidecar-linux-amd64 \$HOME/.local/bin/hospital-agent-sidecar
 
     # Install systemd unit
-    install -m 0644 /tmp/hospital-agent.service \$HOME/.config/systemd/user/hospital-agent.service
+    install -m 0644 /tmp/hospital-agent-sidecar.service \$HOME/.config/systemd/user/hospital-agent-sidecar.service
+
+    # Stop old unit if it exists (migration from hospital-agent -> hospital-agent-sidecar)
+    systemctl --user stop hospital-agent.service 2>/dev/null || true
+    systemctl --user disable hospital-agent.service 2>/dev/null || true
 
     # Write env file
-    cat > \$HOME/.config/hospital-agent/agent.env <<EOF
+    cat > \$HOME/.config/hospital-agent-sidecar/agent.env <<EOF
 HOSPITAL_AGENT_PORT=$AGENT_PORT
 HOSPITAL_AGENT_INBOUND_TOKEN=$INBOUND_TOKEN
 HOSPITAL_AGENT_API_KEY=$API_KEY
@@ -87,20 +95,20 @@ HOSPITAL_AGENT_GATEWAY_URL=http://localhost:$GATEWAY_PORT
 HOSPITAL_AGENT_HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL
 HOSPITAL_AGENT_NAME=$VM
 EOF
-    chmod 0600 \$HOME/.config/hospital-agent/agent.env
+    chmod 0600 \$HOME/.config/hospital-agent-sidecar/agent.env
 
     # Enable linger (keep user services alive after logout)
     loginctl enable-linger themadme 2>/dev/null || true
 
     # Reload and restart
     systemctl --user daemon-reload
-    systemctl --user enable hospital-agent.service
-    systemctl --user restart hospital-agent.service
+    systemctl --user enable hospital-agent-sidecar.service
+    systemctl --user restart hospital-agent-sidecar.service
 
     # Wait and verify
     sleep 2
     echo '--- Status ---'
-    systemctl --user status hospital-agent.service --no-pager || true
+    systemctl --user status hospital-agent-sidecar.service --no-pager || true
     echo ''
     echo '--- Healthz ---'
     curl -sS --max-time 3 http://127.0.0.1:$AGENT_PORT/healthz && echo

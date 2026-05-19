@@ -1,3 +1,3 @@
-module github.com/clawies/hospital-agent
+module github.com/clawies/hospital-agent-sidecar
 
 go 1.22
