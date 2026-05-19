@@ -30,7 +30,7 @@ func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, version st
 		watcher: w,
 		version: version,
 		client: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout: 30 * time.Second, // longer timeout -- hospital does AI diagnosis
 		},
 	}
 }
@@ -86,8 +86,8 @@ type heartbeatPayload struct {
 }
 
 type heartbeatResponse struct {
-	Ack      bool             `json:"ack"`
-	Commands []remoteCommand  `json:"commands,omitempty"`
+	Ack      bool            `json:"ack"`
+	Commands []remoteCommand `json:"commands,omitempty"`
 }
 
 type remoteCommand struct {
@@ -127,20 +127,31 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 }
 
 // --- Crash Report ---
+// Sends crash context + L0 results to hospital.
+// Hospital performs AI diagnosis and responds with repair commands.
 
 type crashPayload struct {
-	AgentName      string                     `json:"agentName"`
-	Framework      string                     `json:"framework"`
-	SidecarVersion string                     `json:"sidecarVersion"`
-	CrashContext   any                        `json:"crashContext"`
-	LocalDiagnosis any                        `json:"localDiagnosis"`
-	RepairResults  []repair.Result            `json:"repairResults"`
-	Timestamp      time.Time                  `json:"timestamp"`
+	AgentName      string          `json:"agentName"`
+	Framework      string          `json:"framework"`
+	SidecarVersion string          `json:"sidecarVersion"`
+	CrashContext   any             `json:"crashContext"`
+	L0Diagnosis    any             `json:"l0Diagnosis"`
+	LocalRepairs   []repair.Result `json:"localRepairs"`
+	Timestamp      time.Time       `json:"timestamp"`
 }
 
 type crashResponse struct {
-	Ack      bool            `json:"ack"`
-	Commands []remoteCommand `json:"commands,omitempty"`
+	Ack       bool            `json:"ack"`
+	Diagnosis *aiDiagnosis    `json:"diagnosis,omitempty"`
+	Commands  []remoteCommand `json:"commands,omitempty"`
+}
+
+type aiDiagnosis struct {
+	Category    string  `json:"category"`
+	RootCause   string  `json:"rootCause"`
+	Confidence  float64 `json:"confidence"`
+	Severity    string  `json:"severity"`
+	SuggestedFix string `json:"suggestedFix"`
 }
 
 func (h *Heartbeat) pushCrashReport(ctx context.Context, ev watcher.CrashEvent) {
@@ -149,12 +160,12 @@ func (h *Heartbeat) pushCrashReport(ctx context.Context, ev watcher.CrashEvent) 
 		Framework:      h.cfg.Framework,
 		SidecarVersion: h.version,
 		CrashContext:   ev.Context,
-		LocalDiagnosis: ev.Diagnosis,
-		RepairResults:  ev.Repairs,
+		L0Diagnosis:    ev.L0Diagnosis,
+		LocalRepairs:   ev.LocalRepairs,
 		Timestamp:      ev.Timestamp,
 	}
 
-	h.logger.Info("pushing crash report to hospital")
+	h.logger.Info("pushing crash report to hospital for AI diagnosis")
 
 	resp, err := h.postJSON(ctx, "/api/v1/heartbeat/crash", payload)
 	if err != nil {
@@ -168,23 +179,41 @@ func (h *Heartbeat) pushCrashReport(ctx context.Context, ev watcher.CrashEvent) 
 		return
 	}
 
-	// Hospital may prescribe additional commands
+	// Log the hospital's AI diagnosis
+	if crashResp.Diagnosis != nil {
+		h.logger.Info("hospital AI diagnosis received",
+			"category", crashResp.Diagnosis.Category,
+			"rootCause", crashResp.Diagnosis.RootCause,
+			"confidence", crashResp.Diagnosis.Confidence,
+			"severity", crashResp.Diagnosis.Severity,
+		)
+	}
+
+	// Execute hospital-prescribed repair commands (AI-informed)
 	if len(crashResp.Commands) > 0 {
-		h.logger.Info("hospital prescribed additional repairs", "count", len(crashResp.Commands))
+		h.logger.Info("hospital prescribed AI-diagnosed repairs", "count", len(crashResp.Commands))
 		h.executeRemoteCommands(crashResp.Commands)
+	} else {
+		h.logger.Info("hospital returned no additional commands")
 	}
 }
 
 // --- Remote command execution ---
 
 func (h *Heartbeat) executeRemoteCommands(commands []remoteCommand) {
-	repairer := repair.New(h.cfg, h.logger)
+	repairer := h.watcher.Repairer()
 
 	var results []repair.Result
 	for _, cmd := range commands {
 		h.logger.Info("executing hospital command", "action", cmd.Action)
 		result := repairer.Execute(cmd.Action)
 		results = append(results, result)
+
+		// If restart succeeded, wait before executing more
+		if cmd.Action == "restart-gateway" && result.Success {
+			h.logger.Info("restart succeeded after hospital command, waiting grace")
+			time.Sleep(10 * time.Second)
+		}
 	}
 
 	// Report results back

@@ -36,12 +36,14 @@ type AgentState struct {
 	LastRepairs []string    `json:"lastRepairs,omitempty"`
 }
 
-// CrashEvent is emitted when a crash is detected and handled.
+// CrashEvent is emitted when a crash is detected and handled locally.
+// The heartbeat goroutine picks this up and pushes it to the hospital
+// for AI diagnosis; the hospital responds with additional repair commands.
 type CrashEvent struct {
-	Context   collector.CrashContext    `json:"context"`
-	Diagnosis diagnosis.DiagnosisResult `json:"diagnosis"`
-	Repairs   []repair.Result          `json:"repairs"`
-	Timestamp time.Time                `json:"timestamp"`
+	Context      collector.CrashContext    `json:"context"`
+	L0Diagnosis  diagnosis.DiagnosisResult `json:"l0Diagnosis"`
+	LocalRepairs []repair.Result           `json:"localRepairs"`
+	Timestamp    time.Time                 `json:"timestamp"`
 }
 
 type Watcher struct {
@@ -72,6 +74,11 @@ func New(cfg *config.Config, logger *slog.Logger, coll *collector.Collector,
 		startedAt: time.Now(),
 		CrashCh:   make(chan CrashEvent, 10),
 	}
+}
+
+// Repairer exposes the repairer for hospital-commanded repairs.
+func (w *Watcher) Repairer() *repair.Repairer {
+	return w.repairer
 }
 
 // State returns the current agent state (thread-safe).
@@ -169,18 +176,18 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 	// Reset repair attempts for new incident
 	w.repairer.ResetAll()
 
-	// Collect crash context
+	// Step 1: Collect crash context
 	w.logger.Info("collecting crash context")
 	cc := w.collector.CollectCrash(ctx)
 
-	// Diagnose (L1 -> L0 fallback)
-	w.logger.Info("diagnosing crash")
-	diag := w.diagnoser.Diagnose(ctx, cc)
+	// Step 2: L0 pattern match for immediate obvious fixes
+	w.logger.Info("running L0 pattern match")
+	l0diag := w.diagnoser.Diagnose(cc)
 
-	// Execute prescribed repairs
-	w.logger.Info("executing repairs", "count", len(diag.Repairs), "layer", diag.Layer)
+	// Step 3: Execute L0 repairs immediately (don't wait for hospital)
+	w.logger.Info("executing L0 repairs", "count", len(l0diag.Repairs))
 	var results []repair.Result
-	for _, action := range diag.Repairs {
+	for _, action := range l0diag.Repairs {
 		result := w.repairer.Execute(action)
 		results = append(results, result)
 
@@ -192,13 +199,13 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 		}
 	}
 
-	// Update state
+	// Step 4: Update state
 	now := time.Now()
 	crashEv := CrashEvent{
-		Context:   cc,
-		Diagnosis: diag,
-		Repairs:   results,
-		Timestamp: now,
+		Context:      cc,
+		L0Diagnosis:  l0diag,
+		LocalRepairs: results,
+		Timestamp:    now,
 	}
 
 	w.mu.Lock()
@@ -215,7 +222,10 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 	w.lastCrashEv = &crashEv
 	w.mu.Unlock()
 
-	// Notify heartbeat goroutine of crash event
+	// Step 5: Push to hospital for AI diagnosis
+	// The heartbeat goroutine picks this up, sends crash context to hospital,
+	// hospital runs AI diagnosis (diagnoseLogs + planRepair), responds with
+	// commands, and heartbeat executes them.
 	select {
 	case w.CrashCh <- crashEv:
 	default:
@@ -229,10 +239,10 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 			succeeded++
 		}
 	}
-	w.logger.Info("crash handling complete",
-		"diagnosis_layer", diag.Layer,
-		"diagnosis", diag.Summary,
+	w.logger.Info("local crash handling complete",
+		"l0_diagnosis", l0diag.Summary,
 		"repairs_total", len(results),
 		"repairs_succeeded", succeeded,
+		"awaiting_hospital_diagnosis", true,
 	)
 }

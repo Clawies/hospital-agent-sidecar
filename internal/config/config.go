@@ -26,9 +26,6 @@ type Config struct {
 	GatewayURL   string // Gateway HTTP URL for health pings (default http://localhost:18789)
 	GatewayPort  int    // Gateway port, used by kill-port repair (default 18789)
 
-	// Local AI
-	LocalAIURL   string // claude-max-api-proxy URL (default http://127.0.0.1:3456/v1)
-	LocalAIModel string // Model to use for local diagnosis (default claude-sonnet-4)
 }
 
 func Load() (*Config, error) {
@@ -44,8 +41,6 @@ func Load() (*Config, error) {
 		SystemdUnit:       envOr("HOSPITAL_AGENT_SYSTEMD_UNIT", "openclaw-gateway.service"),
 		GatewayURL:        envOr("HOSPITAL_AGENT_GATEWAY_URL", "http://localhost:18789"),
 		GatewayPort:       envInt("HOSPITAL_AGENT_GATEWAY_PORT", 18789),
-		LocalAIURL:        envOr("HOSPITAL_AGENT_LOCAL_AI_URL", "http://127.0.0.1:3456/v1"),
-		LocalAIModel:      envOr("HOSPITAL_AGENT_LOCAL_AI_MODEL", "claude-sonnet-4"),
 	}
 
 	if cfg.InboundToken == "" {
