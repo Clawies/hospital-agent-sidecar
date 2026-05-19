@@ -25,7 +25,8 @@ type Config struct {
 	SystemdUnit  string // Systemd unit to watch (default openclaw-gateway.service)
 	GatewayURL   string // Gateway HTTP URL for health pings (empty = skip, default http://localhost:18789)
 	GatewayPort  int    // Gateway port, used by kill-port repair (default 18789)
-	LLMHealthURL string // Optional: LLM proxy health URL (e.g. http://localhost:3456/v1/models)
+	LLMHealthURL  string // Optional: LLM provider health URL (e.g. http://localhost:3456/v1/models, https://openrouter.ai/api/v1/models)
+	LLMHealthAuth string // Optional: auth header value for LLM health check (e.g. "Bearer sk-or-...", "x-api-key ak-...")
 }
 
 func Load() (*Config, error) {
@@ -41,7 +42,8 @@ func Load() (*Config, error) {
 		SystemdUnit:       envOr("HOSPITAL_AGENT_SYSTEMD_UNIT", "openclaw-gateway.service"),
 		GatewayURL:        os.Getenv("HOSPITAL_AGENT_GATEWAY_URL"), // empty = skip gateway health check
 		GatewayPort:       envInt("HOSPITAL_AGENT_GATEWAY_PORT", 18789),
-		LLMHealthURL:      os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_URL"), // optional, empty = skip LLM check
+		LLMHealthURL:      os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_URL"),  // optional, empty = skip LLM check
+		LLMHealthAuth:     os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_AUTH"), // optional auth header for LLM check
 	}
 
 	if cfg.InboundToken == "" {

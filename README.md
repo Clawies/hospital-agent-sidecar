@@ -179,9 +179,32 @@ Each action has 60s cooldown and max 3 attempts per incident.
 | `HOSPITAL_AGENT_SYSTEMD_UNIT` | `openclaw-gateway.service` | no | Systemd unit to watch |
 | `HOSPITAL_AGENT_FRAMEWORK` | `openclaw` | no | `openclaw` or `hermes` |
 | `HOSPITAL_AGENT_GATEWAY_PORT` | `18789` | no | Gateway port (for kill-port repair) |
-| `HOSPITAL_AGENT_GATEWAY_URL` | `http://localhost:18789` | no | Gateway HTTP URL |
+| `HOSPITAL_AGENT_GATEWAY_URL` | _(empty)_ | no | Gateway HTTP URL for health ping (empty = skip, set for OpenClaw) |
 | `HOSPITAL_AGENT_HEARTBEAT_INTERVAL` | `60` | no | Seconds between heartbeats |
 | `HOSPITAL_AGENT_NAME` | hostname | no | Human-readable agent name |
+| `HOSPITAL_AGENT_LLM_HEALTH_URL` | _(empty)_ | no | LLM provider health URL (empty = skip) |
+| `HOSPITAL_AGENT_LLM_HEALTH_AUTH` | _(empty)_ | no | Auth header for LLM health check |
+
+### LLM Health Check Examples
+
+The sidecar can monitor any OpenAI-compatible LLM provider. Set `LLM_HEALTH_URL` to the
+provider's `/v1/models` endpoint and `LLM_HEALTH_AUTH` to the appropriate credentials.
+
+| Provider | LLM_HEALTH_URL | LLM_HEALTH_AUTH |
+|----------|---------------|-----------------|
+| Local claude-max-api proxy | `http://localhost:3456/v1/models` | _(none needed)_ |
+| OpenRouter | `https://openrouter.ai/api/v1/models` | `Bearer sk-or-v1-...` |
+| OpenAI | `https://api.openai.com/v1/models` | `Bearer sk-...` |
+| Anthropic (via proxy) | `http://localhost:3456/v1/models` | _(none needed)_ |
+| Any OpenAI-compatible | `https://your-endpoint/v1/models` | `Bearer your-key` |
+| Anthropic (direct) | `https://api.anthropic.com/v1/models` | `x-api-key sk-ant-...` |
+
+Auth header formats:
+- `Bearer sk-or-...` -- sets `Authorization: Bearer sk-or-...`
+- `x-api-key sk-ant-...` -- sets `x-api-key: sk-ant-...`
+- `sk-or-...` (bare key) -- auto-wrapped as `Authorization: Bearer sk-or-...`
+
+Detects: unreachable (timeout), auth failure (401/403), credits exhausted (429), server error (5xx).
 
 ## Project Structure
 

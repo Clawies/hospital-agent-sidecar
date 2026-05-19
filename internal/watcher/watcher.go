@@ -548,7 +548,29 @@ func (w *Watcher) checkLLMHealth(ctx context.Context) {
 
 func (w *Watcher) pingLLM() error {
 	client := &http.Client{Timeout: healthCheckTimeout}
-	resp, err := client.Get(w.cfg.LLMHealthURL)
+
+	req, err := http.NewRequest(http.MethodGet, w.cfg.LLMHealthURL, nil)
+	if err != nil {
+		return fmt.Errorf("LLM request build: %w", err)
+	}
+
+	// Add auth header if configured.
+	// Supports multiple formats:
+	//   "Bearer sk-or-..."          -> Authorization: Bearer sk-or-...  (OpenRouter, OpenAI)
+	//   "x-api-key sk-ant-..."      -> x-api-key: sk-ant-...           (Anthropic)
+	//   "sk-or-..."                 -> Authorization: Bearer sk-or-...  (bare key, assumes Bearer)
+	if auth := w.cfg.LLMHealthAuth; auth != "" {
+		if strings.HasPrefix(auth, "x-api-key ") {
+			req.Header.Set("x-api-key", strings.TrimPrefix(auth, "x-api-key "))
+		} else if strings.HasPrefix(auth, "Bearer ") {
+			req.Header.Set("Authorization", auth)
+		} else {
+			// Bare key -- assume Bearer
+			req.Header.Set("Authorization", "Bearer "+auth)
+		}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("LLM unreachable: %w", err)
 	}
