@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,10 +54,11 @@ type Watcher struct {
 	diagnoser *diagnosis.Diagnoser
 	repairer  *repair.Repairer
 
-	mu          sync.RWMutex
-	state       AgentState
-	lastCrashEv *CrashEvent
-	startedAt   time.Time
+	mu            sync.RWMutex
+	state         AgentState
+	lastCrashEv   *CrashEvent
+	startedAt     time.Time
+	lastNRestarts int // track systemd NRestarts to detect auto-recovered crashes
 
 	// Channel for notifying heartbeat of crash events
 	CrashCh chan CrashEvent
@@ -65,14 +67,15 @@ type Watcher struct {
 func New(cfg *config.Config, logger *slog.Logger, coll *collector.Collector,
 	diag *diagnosis.Diagnoser, rep *repair.Repairer) *Watcher {
 	return &Watcher{
-		cfg:       cfg,
-		logger:    logger,
-		collector: coll,
-		diagnoser: diag,
-		repairer:  rep,
-		state:     AgentState{Status: StatusUnknown},
-		startedAt: time.Now(),
-		CrashCh:   make(chan CrashEvent, 10),
+		cfg:           cfg,
+		logger:        logger,
+		collector:     coll,
+		diagnoser:     diag,
+		repairer:      rep,
+		state:         AgentState{Status: StatusUnknown},
+		startedAt:     time.Now(),
+		lastNRestarts: -1, // -1 = not yet read, avoids false trigger on first poll
+		CrashCh:       make(chan CrashEvent, 10),
 	}
 }
 
@@ -122,19 +125,35 @@ func (w *Watcher) loop(ctx context.Context) {
 
 func (w *Watcher) poll(ctx context.Context) {
 	status := w.checkUnit(ctx)
+	nRestarts := w.checkNRestarts(ctx)
 
 	w.mu.Lock()
 	prev := w.state.Status
+	prevRestarts := w.lastNRestarts
 	w.state.Status = status
+	w.lastNRestarts = nRestarts
 	w.mu.Unlock()
 
-	// Detect transition to failed state
+	// Detect transition to failed state (systemd gave up restarting)
 	if status == StatusFailed && prev != StatusFailed {
 		w.logger.Warn("agent crash detected", "unit", w.cfg.SystemdUnit, "prev", prev)
 		w.handleCrash(ctx)
+		return
 	}
 
-	// Detect recovery
+	// Detect auto-recovered crash: unit is active but NRestarts incremented.
+	// This catches crashes that systemd's Restart=always fixed before our poll.
+	if nRestarts > prevRestarts && prevRestarts >= 0 && status == StatusActive {
+		w.logger.Warn("agent crash detected (auto-recovered by systemd)",
+			"unit", w.cfg.SystemdUnit,
+			"nRestarts", nRestarts,
+			"prevRestarts", prevRestarts,
+		)
+		w.handleAutoRecoveredCrash(ctx, nRestarts-prevRestarts)
+		return
+	}
+
+	// Detect recovery from failed state
 	if status == StatusActive && prev == StatusFailed {
 		w.logger.Info("agent recovered", "unit", w.cfg.SystemdUnit)
 	}
@@ -164,6 +183,74 @@ func (w *Watcher) checkUnit(ctx context.Context) AgentStatus {
 		return StatusActive
 	}
 	return AgentStatus(result)
+}
+
+// checkNRestarts reads the NRestarts property from systemd.
+// Returns -1 if the property can't be read.
+func (w *Watcher) checkNRestarts(ctx context.Context) int {
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(tctx, "systemctl", "--user", "show",
+		w.cfg.SystemdUnit, "-p", "NRestarts", "--value").Output()
+	if err != nil {
+		return -1
+	}
+
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// handleAutoRecoveredCrash handles crashes where systemd already restarted the
+// unit (Restart=always). The gateway is back up, but we still collect context
+// and report to the hospital for tracking. No local repairs needed.
+func (w *Watcher) handleAutoRecoveredCrash(ctx context.Context, delta int) {
+	if time.Since(w.startedAt) < graceAfterStart {
+		w.logger.Info("within grace period, skipping auto-recovered crash handling")
+		return
+	}
+
+	w.logger.Info("collecting crash context for auto-recovered crash")
+	cc := w.collector.CollectCrash(ctx)
+
+	l0diag := w.diagnoser.Diagnose(cc)
+
+	// No repairs needed -- systemd already restarted. Create a synthetic success result.
+	autoResult := repair.Result{
+		Action:  "restart-gateway",
+		Success: true,
+		Output:  "auto-recovered by systemd (Restart=always)",
+	}
+
+	now := time.Now()
+	crashEv := CrashEvent{
+		Context:      cc,
+		L0Diagnosis:  l0diag,
+		LocalRepairs: []repair.Result{autoResult},
+		Timestamp:    now,
+	}
+
+	w.mu.Lock()
+	w.state.CrashCount += delta
+	w.state.LastCrashAt = &now
+	w.state.LastRepairs = []string{"restart-gateway(systemd)"}
+	w.lastCrashEv = &crashEv
+	w.mu.Unlock()
+
+	// Push to hospital for AI diagnosis and tracking
+	select {
+	case w.CrashCh <- crashEv:
+	default:
+		w.logger.Warn("crash channel full, dropping auto-recovered event")
+	}
+
+	w.logger.Info("auto-recovered crash reported",
+		"l0_diagnosis", l0diag.Summary,
+		"systemd_restarts", delta,
+	)
 }
 
 func (w *Watcher) handleCrash(ctx context.Context) {
