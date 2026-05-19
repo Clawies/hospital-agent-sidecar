@@ -2,7 +2,9 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,8 +18,11 @@ import (
 )
 
 const (
-	pollInterval    = 5 * time.Second
-	graceAfterStart = 30 * time.Second
+	pollInterval       = 5 * time.Second
+	graceAfterStart    = 30 * time.Second
+	healthCheckEvery   = 30 * time.Second // functional health check interval
+	healthCheckTimeout = 10 * time.Second
+	unhealthyThreshold = 3 // consecutive failures before reporting degraded
 )
 
 type AgentStatus string
@@ -28,6 +33,7 @@ const (
 	StatusInactive AgentStatus = "inactive"
 	StatusUnknown  AgentStatus = "unknown"
 	StatusStarting AgentStatus = "starting"
+	StatusDegraded AgentStatus = "degraded" // process alive but not responding
 )
 
 type AgentState struct {
@@ -59,6 +65,10 @@ type Watcher struct {
 	lastCrashEv   *CrashEvent
 	startedAt     time.Time
 	lastNRestarts int // track systemd NRestarts to detect auto-recovered crashes
+
+	// Functional health check state
+	healthFailures int  // consecutive gateway HTTP failures
+	degradedSent   bool // already reported this degraded episode
 
 	// Channel for notifying heartbeat of crash events
 	CrashCh chan CrashEvent
@@ -98,9 +108,10 @@ func (w *Watcher) LastCrashEvent() *CrashEvent {
 	return w.lastCrashEv
 }
 
-// Start begins the background polling loop.
+// Start begins the background polling loop and functional health checker.
 func (w *Watcher) Start(ctx context.Context) {
 	go w.loop(ctx)
+	go w.healthCheckLoop(ctx)
 }
 
 func (w *Watcher) loop(ctx context.Context) {
@@ -331,5 +342,143 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 		"repairs_total", len(results),
 		"repairs_succeeded", succeeded,
 		"awaiting_hospital_diagnosis", true,
+	)
+}
+
+// --- Functional health check ---
+// Detects when the gateway process is alive (systemd active) but non-functional
+// (e.g., LLM provider down, event loop stuck, hung process).
+
+func (w *Watcher) healthCheckLoop(ctx context.Context) {
+	// Wait for grace period before starting health checks
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(graceAfterStart):
+	}
+
+	w.logger.Info("functional health checker started", "interval", healthCheckEvery, "gateway", w.cfg.GatewayURL)
+
+	ticker := time.NewTicker(healthCheckEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.functionalHealthCheck(ctx)
+		}
+	}
+}
+
+func (w *Watcher) functionalHealthCheck(ctx context.Context) {
+	// Only check when systemd says the unit is active
+	state := w.State()
+	if state.Status != StatusActive {
+		return
+	}
+
+	err := w.pingGateway()
+
+	w.mu.Lock()
+	if err != nil {
+		w.healthFailures++
+		failures := w.healthFailures
+		alreadySent := w.degradedSent
+		w.mu.Unlock()
+
+		w.logger.Warn("gateway health check failed",
+			"failures", failures,
+			"threshold", unhealthyThreshold,
+			"err", err,
+		)
+
+		if failures >= unhealthyThreshold && !alreadySent {
+			w.handleDegraded(ctx, err)
+		}
+	} else {
+		wasDegraded := w.healthFailures >= unhealthyThreshold
+		w.healthFailures = 0
+		w.degradedSent = false
+		w.mu.Unlock()
+
+		if wasDegraded {
+			w.logger.Info("gateway recovered from degraded state")
+		}
+	}
+}
+
+func (w *Watcher) pingGateway() error {
+	client := &http.Client{Timeout: healthCheckTimeout}
+	resp, err := client.Get(w.cfg.GatewayURL)
+	if err != nil {
+		return fmt.Errorf("gateway unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Any HTTP response means the gateway is at least responding.
+	// Even 404/500 means the process is alive and handling requests.
+	return nil
+}
+
+func (w *Watcher) handleDegraded(ctx context.Context, lastErr error) {
+	if time.Since(w.startedAt) < graceAfterStart {
+		return
+	}
+
+	w.mu.Lock()
+	w.degradedSent = true
+	w.state.Status = StatusDegraded
+	w.mu.Unlock()
+
+	w.logger.Warn("gateway is degraded: process alive but not responding",
+		"unit", w.cfg.SystemdUnit,
+		"gatewayURL", w.cfg.GatewayURL,
+		"consecutiveFailures", w.healthFailures,
+		"lastErr", lastErr,
+	)
+
+	// Collect context and report to hospital
+	cc := w.collector.CollectCrash(ctx)
+	l0diag := diagnosis.DiagnosisResult{
+		Layer:      "L0",
+		Summary:    fmt.Sprintf("Gateway degraded: process active but HTTP unreachable (%s)", lastErr),
+		Repairs:    []string{"restart-gateway"},
+		Confidence: 0.4,
+	}
+
+	// Try restart since the gateway is unresponsive
+	w.repairer.ResetAll()
+	result := w.repairer.Execute("restart-gateway")
+
+	now := time.Now()
+	crashEv := CrashEvent{
+		Context:      cc,
+		L0Diagnosis:  l0diag,
+		LocalRepairs: []repair.Result{result},
+		Timestamp:    now,
+	}
+
+	w.mu.Lock()
+	w.state.CrashCount++
+	w.state.LastCrashAt = &now
+	if result.Success {
+		w.state.LastRepairs = []string{"restart-gateway"}
+	} else {
+		w.state.LastRepairs = []string{"restart-gateway(FAIL)"}
+	}
+	w.lastCrashEv = &crashEv
+	w.mu.Unlock()
+
+	// Push to hospital for AI diagnosis
+	select {
+	case w.CrashCh <- crashEv:
+	default:
+		w.logger.Warn("crash channel full, dropping degraded event")
+	}
+
+	w.logger.Info("degraded state reported to hospital",
+		"restart_success", result.Success,
 	)
 }
