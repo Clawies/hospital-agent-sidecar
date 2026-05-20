@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/identity"
 )
 
 const (
@@ -25,7 +26,8 @@ const (
 
 // setupConfig holds parsed CLI flags for the setup command.
 type setupConfig struct {
-	apiKey       string
+	apiKey       string // legacy auth
+	hostToken    string // Ed25519 enrollment token (new auth)
 	hospitalURL  string
 	inboundToken string
 	framework    string
@@ -114,6 +116,49 @@ func Run(args []string, version string) error {
 		}
 	}
 
+	// --- Ed25519 registration (if --host-token provided) ---
+	var authMethod string
+	var privateKeyPath string
+	var fingerprint string
+
+	if cfg.hostToken != "" {
+		authMethod = "ed25519"
+		fmt.Println("\n  Generating Ed25519 keypair...")
+
+		pub, priv, err := identity.GenerateKeypair()
+		if err != nil {
+			return fmt.Errorf("generate keypair: %w", err)
+		}
+
+		privateKeyPath = filepath.Join(home, envDir, "agent.key")
+		if err := identity.SavePrivateKey(privateKeyPath, priv); err != nil {
+			return fmt.Errorf("save private key: %w", err)
+		}
+		fmt.Printf("  Private key: %s\n", privateKeyPath)
+
+		fingerprint = identity.PublicKeyFingerprint(pub)
+		fmt.Printf("  Fingerprint: %s\n", fingerprint[:16]+"...")
+
+		// Register with hospital
+		fmt.Printf("  Registering with %s...\n", cfg.hospitalURL)
+		regResp, err := RegisterAgent(cfg.hospitalURL, RegisterRequest{
+			HostToken:   cfg.hostToken,
+			PublicKey:   identity.PublicKeyBase64(pub),
+			Name:        cfg.name,
+			Framework:   cfg.framework,
+			CallbackURL: fmt.Sprintf("http://localhost:%s", cfg.port),
+		})
+		if err != nil {
+			return fmt.Errorf("agent registration failed: %w", err)
+		}
+
+		cfg.inboundToken = regResp.InboundToken
+		fmt.Printf("  Registered: agentId=%s\n", regResp.AgentID)
+		fmt.Printf("  Capabilities: %s\n", strings.Join(regResp.Capabilities, ", "))
+	} else {
+		authMethod = "api_key"
+	}
+
 	// --- Create directories ---
 	dirs := []string{
 		filepath.Join(home, ".local", "bin"),
@@ -150,7 +195,7 @@ func Run(args []string, version string) error {
 
 	// --- Write env file ---
 	envPath := filepath.Join(home, envDir, envFile)
-	envContent := buildEnvFile(cfg, llmURL, llmAuth)
+	envContent := buildEnvFile(cfg, llmURL, llmAuth, authMethod, privateKeyPath, fingerprint)
 	if err := os.WriteFile(envPath, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("write env file: %w", err)
 	}
@@ -194,9 +239,14 @@ func Run(args []string, version string) error {
 	fmt.Println("Setup complete.")
 	fmt.Printf("  Agent: %s (%s)\n", cfg.name, cfg.framework)
 	fmt.Printf("  Hospital: %s\n", cfg.hospitalURL)
+	fmt.Printf("  Auth: %s\n", authMethod)
 	fmt.Printf("  Port: %s\n", cfg.port)
 	fmt.Println()
-	fmt.Println("The sidecar will auto-register with Agent Hospital on the first heartbeat.")
+	if authMethod == "ed25519" {
+		fmt.Println("Agent registered with Ed25519 keypair authentication.")
+	} else {
+		fmt.Println("The sidecar will auto-register with Agent Hospital on the first heartbeat.")
+	}
 	fmt.Println("Check logs: journalctl --user -u hospital-sidecar -f")
 
 	return nil
@@ -216,6 +266,12 @@ func parseFlags(args []string) (*setupConfig, error) {
 			}
 			i++
 			cfg.apiKey = args[i]
+		case "--host-token":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--host-token requires a value")
+			}
+			i++
+			cfg.hostToken = args[i]
 		case "--hospital-url":
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("--hospital-url requires a value")
@@ -265,15 +321,32 @@ func parseFlags(args []string) (*setupConfig, error) {
 			i++
 			cfg.name = args[i]
 		case "--help", "-h":
-			fmt.Println("Usage: hospital-sidecar setup --api-key KEY --hospital-url URL [options]")
+			fmt.Println("Usage: hospital-sidecar setup [--host-token TOKEN | --api-key KEY] --hospital-url URL [options]")
+			fmt.Println()
+			fmt.Println("Authentication (pick one):")
+			fmt.Println("  --host-token TOKEN   Register with Ed25519 keypair (recommended)")
+			fmt.Println("  --api-key KEY        Use legacy API key auth")
+			fmt.Println()
+			fmt.Println("Options:")
+			fmt.Println("  --hospital-url URL   Hospital server URL (required)")
+			fmt.Println("  --name NAME          Agent name (default: hostname)")
+			fmt.Println("  --framework FW       openclaw or hermes (auto-detected)")
+			fmt.Println("  --state-dir DIR      Agent home dir (auto-detected)")
+			fmt.Println("  --systemd-unit UNIT  Unit to monitor (auto-detected)")
+			fmt.Println("  --gateway-port PORT  Gateway port (default: 18789)")
+			fmt.Println("  --port PORT          Sidecar listen port (default: 18793)")
+			fmt.Println("  --inbound-token TOK  Inbound bearer token (auto-generated)")
 			os.Exit(0)
 		default:
 			return nil, fmt.Errorf("unknown flag: %s", args[i])
 		}
 	}
 
-	if cfg.apiKey == "" {
-		return nil, fmt.Errorf("--api-key is required")
+	if cfg.apiKey == "" && cfg.hostToken == "" {
+		return nil, fmt.Errorf("either --host-token or --api-key is required")
+	}
+	if cfg.apiKey != "" && cfg.hostToken != "" {
+		return nil, fmt.Errorf("--host-token and --api-key are mutually exclusive")
 	}
 	if cfg.hospitalURL == "" {
 		return nil, fmt.Errorf("--hospital-url is required")
@@ -295,11 +368,17 @@ func detectFramework(home string) string {
 	return ""
 }
 
-func buildEnvFile(cfg *setupConfig, llmURL, llmAuth string) string {
+func buildEnvFile(cfg *setupConfig, llmURL, llmAuth, authMethod, privateKeyPath, fingerprint string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_PORT=%s\n", cfg.port))
 	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_INBOUND_TOKEN=%s\n", cfg.inboundToken))
-	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_API_KEY=%s\n", cfg.apiKey))
+	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_AUTH_METHOD=%s\n", authMethod))
+	if authMethod == "ed25519" {
+		b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_PRIVATE_KEY_PATH=%s\n", privateKeyPath))
+		b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_FINGERPRINT=%s\n", fingerprint))
+	} else {
+		b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_API_KEY=%s\n", cfg.apiKey))
+	}
 	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_HOSPITAL_URL=%s\n", cfg.hospitalURL))
 	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_STATE_DIR=%s\n", cfg.stateDir))
 	b.WriteString(fmt.Sprintf("HOSPITAL_AGENT_SYSTEMD_UNIT=%s\n", cfg.systemdUnit))

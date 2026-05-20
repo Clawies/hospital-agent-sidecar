@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,7 +25,10 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	diagnoser := diagnosis.New(cfg, logger)
 	repairer := repair.New(cfg, logger)
 	watch := watcher.New(cfg, logger, coll, diagnoser, repairer)
-	hb := heartbeat.New(cfg, logger, watch, coll, version)
+	hb, err := heartbeat.New(cfg, logger, watch, coll, version)
+	if err != nil {
+		return fmt.Errorf("init heartbeat: %w", err)
+	}
 
 	// Initialize direct channel alerter (reads openclaw.json for Slack/Discord/Telegram tokens)
 	alerter := heartbeat.NewAlerter(cfg.StateDir, cfg.Framework, cfg.AgentName, logger)

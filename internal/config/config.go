@@ -14,9 +14,14 @@ type Config struct {
 	InboundToken  string // Bearer token for inbound requests from hospital (required)
 
 	// Agent identity
-	APIKey       string // x-api-key for authenticating TO the hospital server (required)
+	APIKey       string // x-api-key for authenticating TO the hospital server (legacy, required if AuthMethod=api_key)
 	Framework    string // "openclaw" or "hermes" (default "openclaw")
 	AgentName    string // Human-readable name (default hostname)
+
+	// Ed25519 auth (new)
+	AuthMethod       string // "api_key" or "ed25519" (default "api_key")
+	PrivateKeyPath   string // Path to Ed25519 private key file (required if AuthMethod=ed25519)
+	AgentFingerprint string // SHA-256 hex of public key (required if AuthMethod=ed25519)
 
 	// Hospital server
 	HospitalURL       string // Hospital server base URL (required)
@@ -41,6 +46,9 @@ func Load() (*Config, error) {
 		APIKey:            os.Getenv("HOSPITAL_AGENT_API_KEY"),
 		Framework:         envOr("HOSPITAL_AGENT_FRAMEWORK", "openclaw"),
 		AgentName:         envOr("HOSPITAL_AGENT_NAME", hostname()),
+		AuthMethod:        envOr("HOSPITAL_AGENT_AUTH_METHOD", "api_key"),
+		PrivateKeyPath:    os.Getenv("HOSPITAL_AGENT_PRIVATE_KEY_PATH"),
+		AgentFingerprint:  os.Getenv("HOSPITAL_AGENT_FINGERPRINT"),
 		HospitalURL:       os.Getenv("HOSPITAL_AGENT_HOSPITAL_URL"),
 		HeartbeatInterval: envInt("HOSPITAL_AGENT_HEARTBEAT_INTERVAL", 60),
 		StateDir:          envOr("HOSPITAL_AGENT_STATE_DIR", "/home/themadme/.openclaw"),
@@ -76,14 +84,28 @@ func Load() (*Config, error) {
 	if cfg.InboundToken == "" {
 		return nil, errors.New("HOSPITAL_AGENT_INBOUND_TOKEN is required")
 	}
-	if cfg.APIKey == "" {
-		return nil, errors.New("HOSPITAL_AGENT_API_KEY is required")
-	}
 	if cfg.HospitalURL == "" {
 		return nil, errors.New("HOSPITAL_AGENT_HOSPITAL_URL is required")
 	}
 	if cfg.Framework != "openclaw" && cfg.Framework != "hermes" {
 		return nil, errors.New("HOSPITAL_AGENT_FRAMEWORK must be 'openclaw' or 'hermes'")
+	}
+
+	// Validate auth-method-specific fields
+	switch cfg.AuthMethod {
+	case "ed25519":
+		if cfg.PrivateKeyPath == "" {
+			return nil, errors.New("HOSPITAL_AGENT_PRIVATE_KEY_PATH is required when AUTH_METHOD=ed25519")
+		}
+		if cfg.AgentFingerprint == "" {
+			return nil, errors.New("HOSPITAL_AGENT_FINGERPRINT is required when AUTH_METHOD=ed25519")
+		}
+	case "api_key":
+		if cfg.APIKey == "" {
+			return nil, errors.New("HOSPITAL_AGENT_API_KEY is required when AUTH_METHOD=api_key")
+		}
+	default:
+		return nil, fmt.Errorf("HOSPITAL_AGENT_AUTH_METHOD must be 'api_key' or 'ed25519', got %q", cfg.AuthMethod)
 	}
 
 	return cfg, nil

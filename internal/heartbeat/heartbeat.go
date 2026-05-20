@@ -3,31 +3,35 @@ package heartbeat
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/clawies/hospital-agent-sidecar/internal/collector"
 	"github.com/clawies/hospital-agent-sidecar/internal/config"
+	"github.com/clawies/hospital-agent-sidecar/internal/identity"
 	"github.com/clawies/hospital-agent-sidecar/internal/repair"
 	"github.com/clawies/hospital-agent-sidecar/internal/watcher"
 )
 
 type Heartbeat struct {
-	cfg       *config.Config
-	logger    *slog.Logger
-	watcher   *watcher.Watcher
-	collector *collector.Collector
-	alerter   *Alerter
-	version   string
-	client    *http.Client
+	cfg        *config.Config
+	logger     *slog.Logger
+	watcher    *watcher.Watcher
+	collector  *collector.Collector
+	alerter    *Alerter
+	version    string
+	client     *http.Client
+	privateKey ed25519.PrivateKey // nil if using api_key auth
 }
 
-func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, coll *collector.Collector, version string) *Heartbeat {
-	return &Heartbeat{
+func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, coll *collector.Collector, version string) (*Heartbeat, error) {
+	hb := &Heartbeat{
 		cfg:       cfg,
 		logger:    logger,
 		watcher:   w,
@@ -37,6 +41,18 @@ func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, coll *coll
 			Timeout: 30 * time.Second,
 		},
 	}
+
+	// Load Ed25519 private key if using keypair auth
+	if cfg.AuthMethod == "ed25519" {
+		key, err := identity.LoadPrivateKey(cfg.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load agent private key: %w", err)
+		}
+		hb.privateKey = key
+		logger.Info("Ed25519 auth initialized", "fingerprint", cfg.AgentFingerprint[:16]+"...")
+	}
+
+	return hb, nil
 }
 
 // SetAlerter attaches the direct channel alerter (optional, set after construction).
@@ -344,7 +360,17 @@ func (h *Heartbeat) postJSONWith(ctx context.Context, client *http.Client, path 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", h.cfg.APIKey)
+
+	if h.cfg.AuthMethod == "ed25519" && h.privateKey != nil {
+		action := pathToAction(path)
+		token, err := identity.SignAgentJWT(h.privateKey, h.cfg.AgentFingerprint, h.cfg.HospitalURL, action)
+		if err != nil {
+			return nil, fmt.Errorf("sign agent JWT: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.Header.Set("x-api-key", h.cfg.APIKey)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -369,4 +395,22 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// pathToAction maps API path to capability action name for JWT signing.
+func pathToAction(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/heartbeat/crash"):
+		return "crash-report"
+	case strings.HasSuffix(path, "/heartbeat/repair-result"):
+		return "repair-execute"
+	case strings.HasSuffix(path, "/heartbeat/llm-status"):
+		return "llm-status"
+	case strings.HasSuffix(path, "/heartbeat"):
+		return "heartbeat"
+	case strings.HasSuffix(path, "/heal"):
+		return "heal"
+	default:
+		return "unknown"
+	}
 }
