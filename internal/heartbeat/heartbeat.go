@@ -10,35 +10,46 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/clawies/hospital-agent-sidecar/internal/collector"
 	"github.com/clawies/hospital-agent-sidecar/internal/config"
 	"github.com/clawies/hospital-agent-sidecar/internal/repair"
 	"github.com/clawies/hospital-agent-sidecar/internal/watcher"
 )
 
 type Heartbeat struct {
-	cfg     *config.Config
-	logger  *slog.Logger
-	watcher *watcher.Watcher
-	version string
-	client  *http.Client
+	cfg       *config.Config
+	logger    *slog.Logger
+	watcher   *watcher.Watcher
+	collector *collector.Collector
+	alerter   *Alerter
+	version   string
+	client    *http.Client
 }
 
-func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, version string) *Heartbeat {
+func New(cfg *config.Config, logger *slog.Logger, w *watcher.Watcher, coll *collector.Collector, version string) *Heartbeat {
 	return &Heartbeat{
-		cfg:     cfg,
-		logger:  logger,
-		watcher: w,
-		version: version,
+		cfg:       cfg,
+		logger:    logger,
+		watcher:   w,
+		collector: coll,
+		version:   version,
 		client: &http.Client{
-			Timeout: 30 * time.Second, // longer timeout -- hospital does AI diagnosis
+			Timeout: 30 * time.Second,
 		},
 	}
 }
 
-// Start begins the heartbeat ticker and crash report listener.
+// SetAlerter attaches the direct channel alerter (optional, set after construction).
+func (h *Heartbeat) SetAlerter(a *Alerter) {
+	h.alerter = a
+}
+
+// Start begins the heartbeat ticker, crash report listener, LLM status listener, and resource alert listener.
 func (h *Heartbeat) Start(ctx context.Context) {
 	go h.tickerLoop(ctx)
 	go h.crashListener(ctx)
+	go h.llmStatusListener(ctx)
+	go h.resourceListener(ctx)
 }
 
 func (h *Heartbeat) tickerLoop(ctx context.Context) {
@@ -68,8 +79,78 @@ func (h *Heartbeat) crashListener(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-h.watcher.CrashCh:
+			// Send direct alert via connected channels
+			if h.alerter != nil {
+				h.alerter.SendCrashAlert(ev)
+			}
 			h.pushCrashReport(ctx, ev)
 		}
+	}
+}
+
+func (h *Heartbeat) resourceListener(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-h.watcher.ResourceCh:
+			if h.alerter != nil {
+				h.alerter.SendResourceAlert(ev.Resource, ev.UsedPercent, ev.Detail)
+			}
+		}
+	}
+}
+
+func (h *Heartbeat) llmStatusListener(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-h.watcher.LLMStatusCh:
+			h.pushLLMStatus(ctx, ev)
+			// Also send direct alert via connected channels
+			if h.alerter != nil {
+				h.alerter.SendLLMAlert(ev)
+			}
+		}
+	}
+}
+
+// --- LLM Status ---
+
+type llmStatusPayload struct {
+	AgentName string `json:"agentName"`
+	Framework string `json:"framework"`
+	Provider  string `json:"provider"`
+	Status    string `json:"status"`
+	Category  string `json:"category"`
+	HTTPCode  int    `json:"httpCode,omitempty"`
+	Endpoint  string `json:"endpoint"`
+	Detail    string `json:"detail"`
+}
+
+func (h *Heartbeat) pushLLMStatus(ctx context.Context, ev watcher.LLMStatusEvent) {
+	payload := llmStatusPayload{
+		AgentName: h.cfg.AgentName,
+		Framework: h.cfg.Framework,
+		Provider:  ev.Provider,
+		Status:    ev.Status,
+		Category:  ev.Category,
+		HTTPCode:  ev.HTTPCode,
+		Endpoint:  ev.Endpoint,
+		Detail:    ev.Detail,
+	}
+
+	h.logger.Info("pushing LLM status to hospital",
+		"provider", ev.Provider,
+		"status", ev.Status,
+		"category", ev.Category,
+	)
+
+	_, err := h.postJSON(ctx, "/api/v1/heartbeat/llm-status", payload)
+	if err != nil {
+		// Not fatal -- hospital might not have this endpoint yet
+		h.logger.Warn("LLM status push failed (hospital may not support this endpoint yet)", "err", err)
 	}
 }
 
@@ -97,6 +178,7 @@ type remoteCommand struct {
 
 func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 	state := h.watcher.State()
+	sysInfo := h.collector.SystemInfo()
 
 	payload := heartbeatPayload{
 		AgentName:      h.cfg.AgentName,
@@ -105,6 +187,7 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		SidecarVersion: h.version,
 		CallbackURL:    fmt.Sprintf("http://localhost:%s", h.cfg.Port),
 		CrashCount:     state.CrashCount,
+		Metrics:        sysInfo,
 	}
 
 	resp, err := h.postJSON(ctx, "/api/v1/heartbeat", payload)

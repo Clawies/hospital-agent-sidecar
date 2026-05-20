@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -28,6 +29,9 @@ type Config struct {
 	GatewayPort  int    // Gateway port, used by kill-port repair (default 18789)
 	LLMHealthURL  string // Optional: LLM provider health URL (e.g. http://localhost:3456/v1/models, https://openrouter.ai/api/v1/models)
 	LLMHealthAuth string // Optional: auth header value for LLM health check (e.g. "Bearer sk-or-...", "x-api-key ak-...")
+
+	// Extra units to monitor (comma-separated, e.g. "claude-max-api-proxy.service,other.service")
+	ExtraUnits []string
 }
 
 func Load() (*Config, error) {
@@ -45,6 +49,16 @@ func Load() (*Config, error) {
 		GatewayPort:       envInt("HOSPITAL_AGENT_GATEWAY_PORT", 18789),
 		LLMHealthURL:      os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_URL"),  // optional, empty = skip LLM check
 		LLMHealthAuth:     os.Getenv("HOSPITAL_AGENT_LLM_HEALTH_AUTH"), // optional auth header for LLM check
+	}
+
+	// Parse extra units
+	if extra := os.Getenv("HOSPITAL_AGENT_EXTRA_UNITS"); extra != "" {
+		for _, u := range strings.Split(extra, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				cfg.ExtraUnits = append(cfg.ExtraUnits, u)
+			}
+		}
 	}
 
 	// Auto-detect LLM config from openclaw.json if not manually overridden

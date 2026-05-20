@@ -67,29 +67,60 @@ type Watcher struct {
 	lastNRestarts int // track systemd NRestarts to detect auto-recovered crashes
 
 	// Functional health check state
-	healthFailures int  // consecutive gateway HTTP failures
-	degradedSent   bool // already reported this degraded episode
+	healthFailures    int  // consecutive gateway HTTP failures
+	degradedSent      bool // already reported this degraded episode
+	diskAlertSent     bool // already sent disk warning this episode
+	memoryAlertSent   bool // already sent memory warning this episode
 
 	// LLM health check state
 	llmFailures int  // consecutive LLM probe failures
 	llmAlertSent bool // already reported this LLM-down episode
 
+	// Extra unit monitoring state
+	extraUnitFailed map[string]bool // tracks failed state per extra unit
+
 	// Channel for notifying heartbeat of crash events
 	CrashCh chan CrashEvent
+
+	// Channel for LLM status events (picked up by heartbeat for hospital + alerts)
+	LLMStatusCh chan LLMStatusEvent
+
+	// Channel for resource warnings (disk/memory) -- picked up by heartbeat for alerts
+	ResourceCh chan ResourceEvent
+}
+
+// ResourceEvent represents a disk or memory warning.
+type ResourceEvent struct {
+	Resource    string `json:"resource"`    // "disk" or "memory"
+	UsedPercent int    `json:"usedPercent"`
+	Detail      string `json:"detail"`
+}
+
+// LLMStatusEvent represents an LLM provider health status change.
+type LLMStatusEvent struct {
+	Provider string `json:"provider"`
+	Status   string `json:"status"`   // "down", "auth_expired", "credits_exhausted", "provider_outage", "recovered"
+	Category string `json:"category"` // maps to hospital incident category
+	HTTPCode int    `json:"httpCode,omitempty"`
+	Detail   string `json:"detail"`
+	Endpoint string `json:"endpoint"`
 }
 
 func New(cfg *config.Config, logger *slog.Logger, coll *collector.Collector,
 	diag *diagnosis.Diagnoser, rep *repair.Repairer) *Watcher {
 	return &Watcher{
-		cfg:           cfg,
-		logger:        logger,
-		collector:     coll,
-		diagnoser:     diag,
-		repairer:      rep,
-		state:         AgentState{Status: StatusUnknown},
-		startedAt:     time.Now(),
-		lastNRestarts: -1, // -1 = not yet read, avoids false trigger on first poll
-		CrashCh:       make(chan CrashEvent, 10),
+		cfg:             cfg,
+		logger:          logger,
+		collector:       coll,
+		diagnoser:       diag,
+		repairer:        rep,
+		state:           AgentState{Status: StatusUnknown},
+		startedAt:       time.Now(),
+		lastNRestarts:   -1, // -1 = not yet read, avoids false trigger on first poll
+		extraUnitFailed: make(map[string]bool),
+		CrashCh:         make(chan CrashEvent, 10),
+		LLMStatusCh:     make(chan LLMStatusEvent, 10),
+		ResourceCh:      make(chan ResourceEvent, 10),
 	}
 }
 
@@ -116,6 +147,9 @@ func (w *Watcher) LastCrashEvent() *CrashEvent {
 func (w *Watcher) Start(ctx context.Context) {
 	go w.loop(ctx)
 	go w.healthCheckLoop(ctx)
+	if len(w.cfg.ExtraUnits) > 0 {
+		go w.extraUnitsLoop(ctx)
+	}
 }
 
 func (w *Watcher) loop(ctx context.Context) {
@@ -231,6 +265,12 @@ func (w *Watcher) handleAutoRecoveredCrash(ctx context.Context, delta int) {
 	w.logger.Info("collecting crash context for auto-recovered crash")
 	cc := w.collector.CollectCrash(ctx)
 
+	// Skip clean exits -- systemd NRestarts can increment on clean stop+start cycles
+	if cc.ExitCode == 0 {
+		w.logger.Info("clean exit detected in auto-recovered crash (exit code 0), skipping")
+		return
+	}
+
 	l0diag := w.diagnoser.Diagnose(cc)
 
 	// No repairs needed -- systemd already restarted. Create a synthetic success result.
@@ -281,6 +321,15 @@ func (w *Watcher) handleCrash(ctx context.Context) {
 	// Step 1: Collect crash context
 	w.logger.Info("collecting crash context")
 	cc := w.collector.CollectCrash(ctx)
+
+	// Skip clean exits (exit code 0) -- not a crash, just a normal shutdown.
+	// systemd Restart=always will bring it back; no L0 repair or hospital report needed.
+	if cc.ExitCode == 0 {
+		w.logger.Info("clean exit detected (exit code 0), skipping crash handling",
+			"unit", w.cfg.SystemdUnit,
+		)
+		return
+	}
 
 	// Step 2: L0 pattern match for immediate obvious fixes
 	w.logger.Info("running L0 pattern match")
@@ -402,6 +451,61 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 	// Check 2: LLM provider reachability (skip if not configured)
 	if w.cfg.LLMHealthURL != "" {
 		w.checkLLMHealth(ctx)
+	}
+
+	// Check 3: Resource warnings (disk/memory)
+	w.checkResources()
+}
+
+func (w *Watcher) checkResources() {
+	sysInfo := w.collector.SystemInfo()
+
+	// Disk warning at 90%
+	if sysInfo.Disk.UsedPercent >= 90 {
+		w.mu.Lock()
+		alreadySent := w.diskAlertSent
+		w.diskAlertSent = true
+		w.mu.Unlock()
+
+		if !alreadySent {
+			w.logger.Warn("disk usage critical", "percent", sysInfo.Disk.UsedPercent, "availMB", sysInfo.Disk.AvailMB)
+			select {
+			case w.ResourceCh <- ResourceEvent{
+				Resource:    "Disk",
+				UsedPercent: sysInfo.Disk.UsedPercent,
+				Detail:      fmt.Sprintf("%dMB free of %dMB total. Risk of crash if disk fills up.", sysInfo.Disk.AvailMB, sysInfo.Disk.TotalMB),
+			}:
+			default:
+			}
+		}
+	} else if sysInfo.Disk.UsedPercent < 85 {
+		w.mu.Lock()
+		w.diskAlertSent = false
+		w.mu.Unlock()
+	}
+
+	// Memory warning at 90%
+	if sysInfo.Memory.UsedPercent >= 90 {
+		w.mu.Lock()
+		alreadySent := w.memoryAlertSent
+		w.memoryAlertSent = true
+		w.mu.Unlock()
+
+		if !alreadySent {
+			w.logger.Warn("memory usage critical", "percent", sysInfo.Memory.UsedPercent, "availMB", sysInfo.Memory.AvailMB)
+			select {
+			case w.ResourceCh <- ResourceEvent{
+				Resource:    "Memory",
+				UsedPercent: sysInfo.Memory.UsedPercent,
+				Detail:      fmt.Sprintf("%dMB available of %dMB total. OOM kill risk.", sysInfo.Memory.AvailMB, sysInfo.Memory.TotalMB),
+			}:
+			default:
+			}
+		}
+	} else if sysInfo.Memory.UsedPercent < 85 {
+		w.mu.Lock()
+		w.memoryAlertSent = false
+		w.mu.Unlock()
 	}
 }
 
@@ -637,4 +741,173 @@ func (w *Watcher) handleLLMDown(ctx context.Context, lastErr error) {
 	}
 
 	w.logger.Info("LLM-down event reported to hospital for alerting")
+
+	// Emit structured LLM status event
+	llmEv := classifyLLMError(lastErr, w.cfg.LLMHealthURL)
+	select {
+	case w.LLMStatusCh <- llmEv:
+	default:
+		w.logger.Warn("LLM status channel full, dropping event")
+	}
+}
+
+// classifyLLMError maps an LLM health check error to a structured status event.
+func classifyLLMError(err error, endpoint string) LLMStatusEvent {
+	msg := err.Error()
+	ev := LLMStatusEvent{
+		Endpoint: endpoint,
+		Detail:   msg,
+		Status:   "down",
+	}
+
+	switch {
+	case strings.Contains(msg, "auth failed") || strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403"):
+		ev.Category = "auth_expired"
+		ev.Status = "auth_expired"
+		if strings.Contains(msg, "401") {
+			ev.HTTPCode = 401
+		} else {
+			ev.HTTPCode = 403
+		}
+	case strings.Contains(msg, "rate limited") || strings.Contains(msg, "HTTP 429"):
+		ev.Category = "credits_exhausted"
+		ev.Status = "credits_exhausted"
+		ev.HTTPCode = 429
+	case strings.Contains(msg, "server error") || strings.Contains(msg, "HTTP 5"):
+		ev.Category = "provider_outage"
+		ev.Status = "provider_outage"
+		ev.HTTPCode = 500
+	case strings.Contains(msg, "unreachable") || strings.Contains(msg, "connection refused"):
+		ev.Category = "integration_failure"
+		ev.Status = "unreachable"
+	default:
+		ev.Category = "unknown"
+	}
+
+	// Extract provider from endpoint URL
+	switch {
+	case strings.Contains(endpoint, "openrouter.ai"):
+		ev.Provider = "openrouter"
+	case strings.Contains(endpoint, "openai.com"):
+		ev.Provider = "openai"
+	case strings.Contains(endpoint, "anthropic.com"):
+		ev.Provider = "anthropic"
+	case strings.Contains(endpoint, "localhost") || strings.Contains(endpoint, "127.0.0.1"):
+		ev.Provider = "local-proxy"
+	default:
+		ev.Provider = "unknown"
+	}
+
+	return ev
+}
+
+// --- Extra unit monitoring ---
+// Watches additional systemd units (e.g. claude-max-api-proxy.service) and
+// restarts them if they go down.
+
+func (w *Watcher) extraUnitsLoop(ctx context.Context) {
+	w.logger.Info("extra unit monitor started", "units", w.cfg.ExtraUnits)
+
+	// Wait for grace period
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(graceAfterStart):
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, unit := range w.cfg.ExtraUnits {
+				w.checkExtraUnit(ctx, unit)
+			}
+		}
+	}
+}
+
+func (w *Watcher) checkExtraUnit(ctx context.Context, unit string) {
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(tctx, "systemctl", "--user", "is-active", unit).Output()
+	status := strings.TrimSpace(string(out))
+	if err != nil {
+		status = strings.TrimSpace(string(out))
+	}
+
+	w.mu.Lock()
+	wasFailed := w.extraUnitFailed[unit]
+	w.mu.Unlock()
+
+	if status == "active" {
+		if wasFailed {
+			w.logger.Info("extra unit recovered", "unit", unit)
+			w.mu.Lock()
+			w.extraUnitFailed[unit] = false
+			w.mu.Unlock()
+		}
+		return
+	}
+
+	if status == "failed" || status == "inactive" {
+		if !wasFailed {
+			w.logger.Warn("extra unit down, attempting restart", "unit", unit, "status", status)
+			w.mu.Lock()
+			w.extraUnitFailed[unit] = true
+			w.mu.Unlock()
+
+			// Attempt restart
+			exec.Command("systemctl", "--user", "reset-failed", unit).Run()
+			restartOut, restartErr := exec.Command("systemctl", "--user", "restart", unit).CombinedOutput()
+
+			if restartErr != nil {
+				w.logger.Error("extra unit restart failed", "unit", unit, "err", restartErr, "output", string(restartOut))
+			} else {
+				// Wait and verify
+				time.Sleep(3 * time.Second)
+				verifyOut, _ := exec.Command("systemctl", "--user", "is-active", unit).Output()
+				verifyStatus := strings.TrimSpace(string(verifyOut))
+				if verifyStatus == "active" {
+					w.logger.Info("extra unit restarted successfully", "unit", unit)
+					w.mu.Lock()
+					w.extraUnitFailed[unit] = false
+					w.mu.Unlock()
+				} else {
+					w.logger.Error("extra unit still down after restart", "unit", unit, "status", verifyStatus)
+				}
+			}
+
+			// Report to hospital as a crash event
+			cc := w.collector.CollectCrash(ctx)
+			l0diag := diagnosis.DiagnosisResult{
+				Layer:      "L0",
+				Summary:    fmt.Sprintf("Extra unit %s is %s, attempted restart", unit, status),
+				Repairs:    []string{"restart-extra-unit"},
+				Confidence: 0.5,
+			}
+
+			now := time.Now()
+			crashEv := CrashEvent{
+				Context:     cc,
+				L0Diagnosis: l0diag,
+				LocalRepairs: []repair.Result{{
+					Action:  "restart-extra-unit:" + unit,
+					Success: restartErr == nil,
+					Output:  strings.TrimSpace(string(restartOut)),
+				}},
+				Timestamp: now,
+			}
+
+			select {
+			case w.CrashCh <- crashEv:
+			default:
+				w.logger.Warn("crash channel full, dropping extra unit event")
+			}
+		}
+	}
 }

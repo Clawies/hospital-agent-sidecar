@@ -24,7 +24,14 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	diagnoser := diagnosis.New(cfg, logger)
 	repairer := repair.New(cfg, logger)
 	watch := watcher.New(cfg, logger, coll, diagnoser, repairer)
-	hb := heartbeat.New(cfg, logger, watch, version)
+	hb := heartbeat.New(cfg, logger, watch, coll, version)
+
+	// Initialize direct channel alerter (reads openclaw.json for Slack/Discord/Telegram tokens)
+	alerter := heartbeat.NewAlerter(cfg.StateDir, cfg.Framework, cfg.AgentName, logger)
+	if alerter != nil {
+		hb.SetAlerter(alerter)
+	}
+
 	h := &handlers.Handlers{
 		Config:    cfg,
 		Version:   version,
