@@ -2,10 +2,14 @@ package watcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +80,9 @@ type Watcher struct {
 	llmFailures int  // consecutive LLM probe failures
 	llmAlertSent bool // already reported this LLM-down episode
 
+	// Session/cron snapshot tick counter (run every 20th healthCheck tick = ~10min)
+	snapshotTicks int
+
 	// Extra unit monitoring state
 	extraUnitFailed map[string]bool // tracks failed state per extra unit
 
@@ -87,6 +94,23 @@ type Watcher struct {
 
 	// Channel for resource warnings (disk/memory) -- picked up by heartbeat for alerts
 	ResourceCh chan ResourceEvent
+
+	// Channel for integration status events
+	IntegrationStatusCh chan []IntegrationStatusEvent
+
+	// Channel for MCP status events
+	MCPStatusCh chan []MCPStatusEvent
+
+	// Latest snapshots (read by heartbeat for enriched payload)
+	integrationsMu      sync.RWMutex
+	latestIntegrations  []IntegrationStatusEvent
+	latestMCPServers    []MCPStatusEvent
+	latestSessions      *SessionSnapshot
+	latestCronHealth    []CronSnapshot
+
+	// Integration/MCP alert dedup
+	integrationAlertSent map[string]int // consecutive failures per integration
+	mcpAlertSent         map[string]int // consecutive failures per MCP server
 }
 
 // ResourceEvent represents a disk or memory warning.
@@ -106,21 +130,59 @@ type LLMStatusEvent struct {
 	Endpoint string `json:"endpoint"`
 }
 
+// IntegrationStatusEvent represents a messaging integration probe result.
+type IntegrationStatusEvent struct {
+	Integration string `json:"integration"` // "slack", "discord", "telegram", "whatsapp"
+	Connected   bool   `json:"connected"`
+	LatencyMs   int    `json:"latencyMs,omitempty"`
+	Error       string `json:"error,omitempty"`
+	HTTPCode    int    `json:"httpCode,omitempty"`
+}
+
+// MCPStatusEvent represents an MCP server probe result.
+type MCPStatusEvent struct {
+	ServerName string `json:"serverName"`
+	Transport  string `json:"transport"` // "stdio", "sse", "streamable-http"
+	Alive      bool   `json:"alive"`
+	Error      string `json:"error,omitempty"`
+}
+
+// SessionSnapshot captures session health data.
+type SessionSnapshot struct {
+	TotalCount       int    `json:"totalCount"`
+	TotalSizeMb      int    `json:"totalSizeMb"`
+	OldestTimestamp  string `json:"oldestTimestamp,omitempty"`
+}
+
+// CronSnapshot captures cron health data.
+type CronSnapshot struct {
+	ID         string `json:"id"`
+	Schedule   string `json:"schedule"`
+	LastRun    string `json:"lastRun,omitempty"`
+	LastStatus string `json:"lastStatus"`
+	LastError  string `json:"lastError,omitempty"`
+	Overdue    bool   `json:"overdue"`
+}
+
 func New(cfg *config.Config, logger *slog.Logger, coll *collector.Collector,
 	diag *diagnosis.Diagnoser, rep *repair.Repairer) *Watcher {
 	return &Watcher{
-		cfg:             cfg,
-		logger:          logger,
-		collector:       coll,
-		diagnoser:       diag,
-		repairer:        rep,
-		state:           AgentState{Status: StatusUnknown},
-		startedAt:       time.Now(),
-		lastNRestarts:   -1, // -1 = not yet read, avoids false trigger on first poll
-		extraUnitFailed: make(map[string]bool),
-		CrashCh:         make(chan CrashEvent, 10),
-		LLMStatusCh:     make(chan LLMStatusEvent, 10),
-		ResourceCh:      make(chan ResourceEvent, 10),
+		cfg:                  cfg,
+		logger:               logger,
+		collector:            coll,
+		diagnoser:            diag,
+		repairer:             rep,
+		state:                AgentState{Status: StatusUnknown},
+		startedAt:            time.Now(),
+		lastNRestarts:        -1, // -1 = not yet read, avoids false trigger on first poll
+		extraUnitFailed:      make(map[string]bool),
+		CrashCh:              make(chan CrashEvent, 10),
+		LLMStatusCh:          make(chan LLMStatusEvent, 10),
+		ResourceCh:           make(chan ResourceEvent, 10),
+		IntegrationStatusCh:  make(chan []IntegrationStatusEvent, 8),
+		MCPStatusCh:          make(chan []MCPStatusEvent, 8),
+		integrationAlertSent: make(map[string]int),
+		mcpAlertSent:         make(map[string]int),
 	}
 }
 
@@ -150,6 +212,36 @@ func (w *Watcher) Start(ctx context.Context) {
 	if len(w.cfg.ExtraUnits) > 0 {
 		go w.extraUnitsLoop(ctx)
 	}
+	go w.integrationHealthLoop(ctx)
+	go w.mcpHealthLoop(ctx)
+}
+
+// LatestIntegrations returns the most recent integration probe results.
+func (w *Watcher) LatestIntegrations() []IntegrationStatusEvent {
+	w.integrationsMu.RLock()
+	defer w.integrationsMu.RUnlock()
+	return w.latestIntegrations
+}
+
+// LatestMCPServers returns the most recent MCP server probe results.
+func (w *Watcher) LatestMCPServers() []MCPStatusEvent {
+	w.integrationsMu.RLock()
+	defer w.integrationsMu.RUnlock()
+	return w.latestMCPServers
+}
+
+// LatestSessions returns the most recent session snapshot.
+func (w *Watcher) LatestSessions() *SessionSnapshot {
+	w.integrationsMu.RLock()
+	defer w.integrationsMu.RUnlock()
+	return w.latestSessions
+}
+
+// LatestCronHealth returns the most recent cron health snapshot.
+func (w *Watcher) LatestCronHealth() []CronSnapshot {
+	w.integrationsMu.RLock()
+	defer w.integrationsMu.RUnlock()
+	return w.latestCronHealth
 }
 
 func (w *Watcher) loop(ctx context.Context) {
@@ -455,6 +547,14 @@ func (w *Watcher) functionalHealthCheck(ctx context.Context) {
 
 	// Check 3: Resource warnings (disk/memory)
 	w.checkResources()
+
+	// Check 4: Session & cron snapshots (every ~10 minutes, not every 30s)
+	w.snapshotTicks++
+	if w.snapshotTicks >= 20 {
+		w.snapshotTicks = 0
+		w.collectSessionSnapshot()
+		w.collectCronSnapshot()
+	}
 }
 
 func (w *Watcher) checkResources() {
@@ -908,6 +1008,476 @@ func (w *Watcher) checkExtraUnit(ctx context.Context, unit string) {
 			default:
 				w.logger.Warn("crash channel full, dropping extra unit event")
 			}
+		}
+	}
+}
+
+// --- Integration health check ---
+// Probes messaging integrations (Slack, Discord, Telegram, WhatsApp) to verify
+// that tokens are valid and services are reachable.
+
+const integrationCheckEvery = 5 * time.Minute
+
+func (w *Watcher) integrationHealthLoop(ctx context.Context) {
+	// Wait for grace period
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(graceAfterStart):
+	}
+
+	channels, _, err := config.DiscoverChannels(w.cfg.StateDir, w.cfg.Framework)
+	if err != nil || len(channels) == 0 {
+		w.logger.Info("no integrations to monitor", "err", err)
+		return
+	}
+
+	w.logger.Info("integration health checker started", "count", len(channels), "interval", integrationCheckEvery)
+
+	// Run first check immediately
+	w.probeIntegrations(channels)
+
+	ticker := time.NewTicker(integrationCheckEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Re-discover channels in case config changed
+			if updated, _, err := config.DiscoverChannels(w.cfg.StateDir, w.cfg.Framework); err == nil && len(updated) > 0 {
+				channels = updated
+			}
+			w.probeIntegrations(channels)
+		}
+	}
+}
+
+func (w *Watcher) probeIntegrations(channels []config.ChannelConfig) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	var results []IntegrationStatusEvent
+
+	for _, ch := range channels {
+		ev := IntegrationStatusEvent{Integration: ch.Type}
+
+		switch ch.Type {
+		case "slack":
+			ev = w.probeSlack(client, ch.Token)
+		case "discord":
+			ev = w.probeDiscord(client, ch.Token)
+		case "telegram":
+			ev = w.probeTelegram(client, ch.Token)
+		case "whatsapp":
+			ev = w.probeWhatsApp()
+		default:
+			ev.Connected = false
+			ev.Error = "unknown integration type"
+		}
+
+		results = append(results, ev)
+	}
+
+	// Store latest results
+	w.integrationsMu.Lock()
+	w.latestIntegrations = results
+	w.integrationsMu.Unlock()
+
+	// Push to channel for heartbeat
+	select {
+	case w.IntegrationStatusCh <- results:
+	default:
+	}
+
+	// Check for failures and alert
+	for _, ev := range results {
+		if !ev.Connected {
+			w.mu.Lock()
+			w.integrationAlertSent[ev.Integration]++
+			failures := w.integrationAlertSent[ev.Integration]
+			w.mu.Unlock()
+
+			if failures == 2 { // alert on 2nd consecutive failure
+				w.logger.Warn("integration probe failed", "integration", ev.Integration, "error", ev.Error)
+			}
+		} else {
+			w.mu.Lock()
+			w.integrationAlertSent[ev.Integration] = 0
+			w.mu.Unlock()
+		}
+	}
+}
+
+func (w *Watcher) probeSlack(client *http.Client, token string) IntegrationStatusEvent {
+	ev := IntegrationStatusEvent{Integration: "slack"}
+	if token == "" {
+		ev.Connected = false
+		ev.Error = "no bot token configured"
+		return ev
+	}
+
+	start := time.Now()
+	req, _ := http.NewRequest("POST", "https://slack.com/api/auth.test", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	ev.LatencyMs = int(time.Since(start).Milliseconds())
+	if err != nil {
+		ev.Connected = false
+		ev.Error = fmt.Sprintf("request failed: %v", err)
+		return ev
+	}
+	defer resp.Body.Close()
+	ev.HTTPCode = resp.StatusCode
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	json.Unmarshal(body, &result)
+
+	ev.Connected = result.OK
+	if !result.OK {
+		ev.Error = result.Error
+	}
+	return ev
+}
+
+func (w *Watcher) probeDiscord(client *http.Client, token string) IntegrationStatusEvent {
+	ev := IntegrationStatusEvent{Integration: "discord"}
+	if token == "" {
+		ev.Connected = false
+		ev.Error = "no bot token configured"
+		return ev
+	}
+
+	start := time.Now()
+	req, _ := http.NewRequest("GET", "https://discord.com/api/v10/users/@me", nil)
+	req.Header.Set("Authorization", "Bot "+token)
+
+	resp, err := client.Do(req)
+	ev.LatencyMs = int(time.Since(start).Milliseconds())
+	if err != nil {
+		ev.Connected = false
+		ev.Error = fmt.Sprintf("request failed: %v", err)
+		return ev
+	}
+	defer resp.Body.Close()
+	ev.HTTPCode = resp.StatusCode
+
+	if resp.StatusCode == 200 {
+		ev.Connected = true
+	} else {
+		ev.Connected = false
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		ev.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return ev
+}
+
+func (w *Watcher) probeTelegram(client *http.Client, token string) IntegrationStatusEvent {
+	ev := IntegrationStatusEvent{Integration: "telegram"}
+	if token == "" {
+		ev.Connected = false
+		ev.Error = "no bot token configured"
+		return ev
+	}
+
+	start := time.Now()
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", token)
+	resp, err := client.Get(url)
+	ev.LatencyMs = int(time.Since(start).Milliseconds())
+	if err != nil {
+		ev.Connected = false
+		ev.Error = fmt.Sprintf("request failed: %v", err)
+		return ev
+	}
+	defer resp.Body.Close()
+	ev.HTTPCode = resp.StatusCode
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	json.Unmarshal(body, &result)
+
+	ev.Connected = result.OK
+	if !result.OK {
+		ev.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	return ev
+}
+
+func (w *Watcher) probeWhatsApp() IntegrationStatusEvent {
+	ev := IntegrationStatusEvent{Integration: "whatsapp"}
+
+	// WhatsApp (Baileys) sessions are local files -- check if credentials exist
+	credDir := fmt.Sprintf("%s/credentials", w.cfg.StateDir)
+	entries, err := os.ReadDir(credDir)
+	if err != nil {
+		ev.Connected = false
+		ev.Error = "credentials directory not found"
+		return ev
+	}
+
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "whatsapp-") && e.IsDir() {
+			credsFile := fmt.Sprintf("%s/%s/creds.json", credDir, e.Name())
+			if _, err := os.Stat(credsFile); err == nil {
+				ev.Connected = true
+				return ev
+			}
+		}
+	}
+
+	ev.Connected = false
+	ev.Error = "no WhatsApp session found (QR scan required)"
+	return ev
+}
+
+// --- MCP server health check ---
+// Probes configured MCP servers to verify they are available.
+
+func (w *Watcher) mcpHealthLoop(ctx context.Context) {
+	// Wait for grace period
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(graceAfterStart):
+	}
+
+	servers, err := config.DiscoverMCPServers(w.cfg.StateDir, w.cfg.Framework)
+	if err != nil || len(servers) == 0 {
+		w.logger.Info("no MCP servers to monitor", "err", err)
+		return
+	}
+
+	w.logger.Info("MCP health checker started", "count", len(servers), "interval", integrationCheckEvery)
+
+	// Run first check immediately
+	w.probeMCPServers(servers)
+
+	ticker := time.NewTicker(integrationCheckEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if updated, err := config.DiscoverMCPServers(w.cfg.StateDir, w.cfg.Framework); err == nil && len(updated) > 0 {
+				servers = updated
+			}
+			w.probeMCPServers(servers)
+		}
+	}
+}
+
+func (w *Watcher) probeMCPServers(servers []config.MCPServerConfig) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	var results []MCPStatusEvent
+
+	for _, srv := range servers {
+		ev := MCPStatusEvent{
+			ServerName: srv.Name,
+			Transport:  srv.Transport,
+		}
+
+		switch srv.Transport {
+		case "stdio":
+			// Check if the command binary exists on PATH
+			_, err := exec.LookPath(srv.Command)
+			if err != nil {
+				ev.Alive = false
+				ev.Error = fmt.Sprintf("binary not found: %s", srv.Command)
+			} else {
+				ev.Alive = true
+			}
+		case "sse", "streamable-http":
+			// Check if the HTTP endpoint is reachable
+			if srv.URL == "" {
+				ev.Alive = false
+				ev.Error = "no URL configured"
+			} else {
+				resp, err := client.Get(srv.URL)
+				if err != nil {
+					ev.Alive = false
+					ev.Error = fmt.Sprintf("unreachable: %v", err)
+				} else {
+					resp.Body.Close()
+					ev.Alive = true
+				}
+			}
+		default:
+			ev.Alive = false
+			ev.Error = fmt.Sprintf("unknown transport: %s", srv.Transport)
+		}
+
+		results = append(results, ev)
+	}
+
+	// Store latest results
+	w.integrationsMu.Lock()
+	w.latestMCPServers = results
+	w.integrationsMu.Unlock()
+
+	// Push to channel for heartbeat
+	select {
+	case w.MCPStatusCh <- results:
+	default:
+	}
+
+	// Check for failures and alert
+	for _, ev := range results {
+		if !ev.Alive {
+			w.mu.Lock()
+			w.mcpAlertSent[ev.ServerName]++
+			failures := w.mcpAlertSent[ev.ServerName]
+			w.mu.Unlock()
+
+			if failures == 2 {
+				w.logger.Warn("MCP server probe failed", "server", ev.ServerName, "transport", ev.Transport, "error", ev.Error)
+			}
+		} else {
+			w.mu.Lock()
+			w.mcpAlertSent[ev.ServerName] = 0
+			w.mu.Unlock()
+		}
+	}
+}
+
+// --- Session snapshot ---
+
+func (w *Watcher) collectSessionSnapshot() {
+	var sessionsDir string
+	if w.cfg.Framework == "openclaw" {
+		// OpenClaw stores sessions under <stateDir>/agents/*/sessions/
+		sessionsDir = filepath.Join(w.cfg.StateDir, "agents")
+	} else {
+		// Hermes stores sessions under <stateDir>/sessions/
+		sessionsDir = filepath.Join(w.cfg.StateDir, "sessions")
+	}
+
+	if _, err := os.Stat(sessionsDir); err != nil {
+		return // no sessions dir
+	}
+
+	var totalCount int
+	var totalSize int64
+	var oldest time.Time
+
+	err := filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		totalCount++
+		totalSize += info.Size()
+		if oldest.IsZero() || info.ModTime().Before(oldest) {
+			oldest = info.ModTime()
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+
+	snap := &SessionSnapshot{
+		TotalCount:  totalCount,
+		TotalSizeMb: int(totalSize / (1024 * 1024)),
+	}
+	if !oldest.IsZero() {
+		ts := oldest.Format(time.RFC3339)
+		snap.OldestTimestamp = ts
+	}
+
+	w.integrationsMu.Lock()
+	w.latestSessions = snap
+	w.integrationsMu.Unlock()
+
+	if totalCount > 100 || totalSize > 500*1024*1024 {
+		w.logger.Warn("session bloat detected", "count", totalCount, "sizeMb", snap.TotalSizeMb)
+	}
+}
+
+// --- Cron snapshot ---
+
+func (w *Watcher) collectCronSnapshot() {
+	if w.cfg.Framework != "openclaw" {
+		return // cron snapshot only for OpenClaw (uses CLI)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "openclaw", "cron", "list", "--json").Output()
+	if err != nil {
+		// CLI not available or no crons -- not fatal
+		return
+	}
+
+	var cronList []struct {
+		ID         string `json:"id"`
+		Cron       string `json:"cron"`
+		Schedule   string `json:"schedule"`
+		LastRun    string `json:"lastRun"`
+		LastStatus string `json:"lastStatus"`
+		LastError  string `json:"lastError"`
+		NextRun    string `json:"nextRun"`
+	}
+
+	if err := json.Unmarshal(out, &cronList); err != nil {
+		return
+	}
+
+	var snapshots []CronSnapshot
+	now := time.Now()
+
+	for _, c := range cronList {
+		sched := c.Cron
+		if sched == "" {
+			sched = c.Schedule
+		}
+
+		snap := CronSnapshot{
+			ID:         c.ID,
+			Schedule:   sched,
+			LastRun:    c.LastRun,
+			LastStatus: c.LastStatus,
+			LastError:  c.LastError,
+		}
+
+		// Check if overdue: last run > 2x the expected interval
+		if c.LastRun != "" && c.NextRun != "" {
+			lastRun, err1 := time.Parse(time.RFC3339, c.LastRun)
+			nextRun, err2 := time.Parse(time.RFC3339, c.NextRun)
+			if err1 == nil && err2 == nil {
+				interval := nextRun.Sub(lastRun)
+				if interval > 0 && now.Sub(lastRun) > 2*interval {
+					snap.Overdue = true
+				}
+			}
+		}
+
+		snapshots = append(snapshots, snap)
+	}
+
+	w.integrationsMu.Lock()
+	w.latestCronHealth = snapshots
+	w.integrationsMu.Unlock()
+
+	// Log any failing crons
+	for _, s := range snapshots {
+		if s.LastStatus == "error" || s.Overdue {
+			w.logger.Warn("cron health issue", "id", s.ID, "status", s.LastStatus, "overdue", s.Overdue)
 		}
 	}
 }

@@ -60,12 +60,15 @@ func (h *Heartbeat) SetAlerter(a *Alerter) {
 	h.alerter = a
 }
 
-// Start begins the heartbeat ticker, crash report listener, LLM status listener, and resource alert listener.
+// Start begins the heartbeat ticker, crash report listener, LLM status listener,
+// resource alert listener, integration status listener, and MCP status listener.
 func (h *Heartbeat) Start(ctx context.Context) {
 	go h.tickerLoop(ctx)
 	go h.crashListener(ctx)
 	go h.llmStatusListener(ctx)
 	go h.resourceListener(ctx)
+	go h.integrationStatusListener(ctx)
+	go h.mcpStatusListener(ctx)
 }
 
 func (h *Heartbeat) tickerLoop(ctx context.Context) {
@@ -132,6 +135,86 @@ func (h *Heartbeat) llmStatusListener(ctx context.Context) {
 	}
 }
 
+func (h *Heartbeat) integrationStatusListener(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evs := <-h.watcher.IntegrationStatusCh:
+			h.pushIntegrationStatus(ctx, evs)
+			// Send direct alerts for failed integrations
+			if h.alerter != nil {
+				for _, ev := range evs {
+					if !ev.Connected && ev.Error != "" {
+						h.alerter.SendIntegrationAlert(ev.Integration, ev.Error)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (h *Heartbeat) mcpStatusListener(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evs := <-h.watcher.MCPStatusCh:
+			h.pushMCPStatus(ctx, evs)
+			// Send direct alerts for dead MCP servers
+			if h.alerter != nil {
+				for _, ev := range evs {
+					if !ev.Alive && ev.Error != "" {
+						h.alerter.SendMCPAlert(ev.ServerName, ev.Transport, ev.Error)
+					}
+				}
+			}
+		}
+	}
+}
+
+// --- Integration Status ---
+
+type integrationStatusPayload struct {
+	AgentName    string                          `json:"agentName"`
+	Framework    string                          `json:"framework"`
+	Integrations []watcher.IntegrationStatusEvent `json:"integrations"`
+}
+
+func (h *Heartbeat) pushIntegrationStatus(ctx context.Context, evs []watcher.IntegrationStatusEvent) {
+	payload := integrationStatusPayload{
+		AgentName:    h.cfg.AgentName,
+		Framework:    h.cfg.Framework,
+		Integrations: evs,
+	}
+
+	_, err := h.postJSON(ctx, "/api/v1/heartbeat/integration-status", payload)
+	if err != nil {
+		h.logger.Warn("integration status push failed", "err", err)
+	}
+}
+
+// --- MCP Status ---
+
+type mcpStatusPayload struct {
+	AgentName  string                   `json:"agentName"`
+	Framework  string                   `json:"framework"`
+	MCPServers []watcher.MCPStatusEvent `json:"mcpServers"`
+}
+
+func (h *Heartbeat) pushMCPStatus(ctx context.Context, evs []watcher.MCPStatusEvent) {
+	payload := mcpStatusPayload{
+		AgentName:  h.cfg.AgentName,
+		Framework:  h.cfg.Framework,
+		MCPServers: evs,
+	}
+
+	_, err := h.postJSON(ctx, "/api/v1/heartbeat/mcp-status", payload)
+	if err != nil {
+		h.logger.Warn("MCP status push failed", "err", err)
+	}
+}
+
 // --- LLM Status ---
 
 type llmStatusPayload struct {
@@ -180,6 +263,12 @@ type heartbeatPayload struct {
 	CallbackURL    string `json:"callbackUrl"`
 	CrashCount     int    `json:"crashCount"`
 	Metrics        any    `json:"metrics,omitempty"`
+
+	// Enriched probe data from sidecar
+	Integrations []watcher.IntegrationStatusEvent `json:"integrations,omitempty"`
+	MCPServers   []watcher.MCPStatusEvent         `json:"mcpServers,omitempty"`
+	Sessions     *watcher.SessionSnapshot         `json:"sessions,omitempty"`
+	CronHealth   []watcher.CronSnapshot           `json:"cronHealth,omitempty"`
 }
 
 type heartbeatResponse struct {
@@ -204,6 +293,10 @@ func (h *Heartbeat) sendHeartbeat(ctx context.Context) {
 		CallbackURL:    fmt.Sprintf("http://localhost:%s", h.cfg.Port),
 		CrashCount:     state.CrashCount,
 		Metrics:        sysInfo,
+		Integrations:   h.watcher.LatestIntegrations(),
+		MCPServers:     h.watcher.LatestMCPServers(),
+		Sessions:       h.watcher.LatestSessions(),
+		CronHealth:     h.watcher.LatestCronHealth(),
 	}
 
 	resp, err := h.postJSON(ctx, "/api/v1/heartbeat", payload)
@@ -406,6 +499,10 @@ func pathToAction(path string) string {
 		return "repair-execute"
 	case strings.HasSuffix(path, "/heartbeat/llm-status"):
 		return "llm-status"
+	case strings.HasSuffix(path, "/heartbeat/integration-status"):
+		return "integration-status"
+	case strings.HasSuffix(path, "/heartbeat/mcp-status"):
+		return "mcp-status"
 	case strings.HasSuffix(path, "/heartbeat"):
 		return "heartbeat"
 	case strings.HasSuffix(path, "/heal"):

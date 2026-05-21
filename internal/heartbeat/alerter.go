@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/clawies/hospital-agent-sidecar/internal/config"
 	"github.com/clawies/hospital-agent-sidecar/internal/watcher"
 )
 
@@ -229,78 +229,55 @@ func (a *Alerter) sendTelegram(token, chatID, msg string) error {
 	return nil
 }
 
-// --- Channel discovery from openclaw.json ---
+// SendIntegrationAlert sends an integration failure alert to all configured channels.
+func (a *Alerter) SendIntegrationAlert(integration string, err string) {
+	msg := fmt.Sprintf("[Hospital Sidecar] Agent %s: %s integration is DOWN. %s",
+		a.agentName, integration, err)
+	a.broadcast(msg)
+}
+
+// SendMCPAlert sends an MCP server failure alert to all configured channels.
+func (a *Alerter) SendMCPAlert(serverName, transport, errMsg string) {
+	msg := fmt.Sprintf("[Hospital Sidecar] Agent %s: MCP server '%s' (%s) is UNREACHABLE. %s",
+		a.agentName, serverName, transport, errMsg)
+	a.broadcast(msg)
+}
+
+// --- Channel discovery from agent config ---
+// Uses the shared config.DiscoverChannels reader.
 
 func discoverChannels(stateDir, framework string, logger *slog.Logger, client *http.Client) []alertChannel {
-	var configPath string
-	if framework == "hermes" {
-		configPath = filepath.Join(stateDir, "hermes.json")
-	} else {
-		configPath = filepath.Join(stateDir, "openclaw.json")
-	}
-
-	data, err := os.ReadFile(configPath)
+	channelCfgs, _, err := config.DiscoverChannels(stateDir, framework)
 	if err != nil {
-		logger.Warn("cannot read agent config for channel discovery", "path", configPath, "err", err)
-		return nil
-	}
-
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		logger.Warn("cannot parse agent config", "path", configPath, "err", err)
+		logger.Warn("cannot read agent config for channel discovery", "err", err)
 		return nil
 	}
 
 	var channels []alertChannel
 
-	// Extract env section for resolving ${VAR} patterns in tokens
-	envMap, _ := root["env"].(map[string]any)
+	for _, ch := range channelCfgs {
+		if ch.Token == "" {
+			continue
+		}
 
-	channelsCfg, ok := root["channels"].(map[string]any)
-	if !ok {
-		return nil
-	}
-
-	// Slack: token is in botToken, but channel IDs aren't stored in openclaw.json
-	// (OpenClaw uses wildcard "*" channels). We use the Slack API to discover
-	// which channels the bot is a member of, and pick the first one.
-	if slack, ok := channelsCfg["slack"].(map[string]any); ok {
-		enabled, _ := slack["enabled"].(bool)
-		token := resolveValue(slack["botToken"], envMap)
-		if token != "" && enabled {
-			// Check for explicit channel ID in env override first
+		switch ch.Type {
+		case "slack":
 			if alertCh := os.Getenv("HOSPITAL_AGENT_ALERT_SLACK_CHANNEL"); alertCh != "" {
-				channels = append(channels, alertChannel{Type: "slack", Token: token, TargetID: alertCh})
+				channels = append(channels, alertChannel{Type: "slack", Token: ch.Token, TargetID: alertCh})
 				logger.Info("slack alert channel from env", "channel", alertCh)
 			} else {
-				// Discover channels via Slack API
-				channelID := discoverSlackChannel(token, client, logger)
+				channelID := discoverSlackChannel(ch.Token, client, logger)
 				if channelID != "" {
-					channels = append(channels, alertChannel{Type: "slack", Token: token, TargetID: channelID})
+					channels = append(channels, alertChannel{Type: "slack", Token: ch.Token, TargetID: channelID})
 				}
 			}
-		}
-	}
-
-	// Discord: similar structure
-	if discord, ok := channelsCfg["discord"].(map[string]any); ok {
-		enabled, _ := discord["enabled"].(bool)
-		token := resolveValue(discord["botToken"], envMap)
-		if token != "" && enabled {
+		case "discord":
 			if alertCh := os.Getenv("HOSPITAL_AGENT_ALERT_DISCORD_CHANNEL"); alertCh != "" {
-				channels = append(channels, alertChannel{Type: "discord", Token: token, TargetID: alertCh})
+				channels = append(channels, alertChannel{Type: "discord", Token: ch.Token, TargetID: alertCh})
 			}
-			// Discord channel discovery would require listing guilds + channels, skip for now
-		}
-	}
-
-	// Telegram
-	if telegram, ok := channelsCfg["telegram"].(map[string]any); ok {
-		enabled, _ := telegram["enabled"].(bool)
-		token := resolveValue(telegram["botToken"], envMap)
-		if token != "" && enabled {
+		case "telegram":
 			if alertCh := os.Getenv("HOSPITAL_AGENT_ALERT_TELEGRAM_CHAT"); alertCh != "" {
-				channels = append(channels, alertChannel{Type: "telegram", Token: token, TargetID: alertCh})
+				channels = append(channels, alertChannel{Type: "telegram", Token: ch.Token, TargetID: alertCh})
 			}
 		}
 	}
@@ -377,28 +354,3 @@ func discoverSlackChannel(token string, client *http.Client, logger *slog.Logger
 	return memberChannels[0].ID
 }
 
-// resolveValue handles ${VAR} patterns and raw strings for config values.
-func resolveValue(val any, envMap map[string]any) string {
-	s, ok := val.(string)
-	if !ok || s == "" {
-		return ""
-	}
-
-	// Check for ${VAR_NAME} pattern
-	if strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}") {
-		varName := s[2 : len(s)-1]
-		// Try envMap from openclaw.json first
-		if envMap != nil {
-			if v, ok := envMap[varName].(string); ok && v != "" {
-				return v
-			}
-		}
-		// Try OS env
-		if v := os.Getenv(varName); v != "" {
-			return v
-		}
-		return ""
-	}
-
-	return s
-}
