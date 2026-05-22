@@ -171,6 +171,13 @@ func Run(args []string, version string) error {
 		}
 	}
 
+	// Stop existing services before replacing the binary. Re-running setup is the
+	// upgrade path for npx installs, and Linux can reject truncating a running
+	// executable with ETXTBSY ("text file busy").
+	_ = runCmd("systemctl", "--user", "stop", serviceName)
+	_ = runCmd("systemctl", "--user", "stop", oldService)
+	_ = runCmd("systemctl", "--user", "disable", oldService)
+
 	// --- Install binary ---
 	exe, err := os.Executable()
 	if err != nil {
@@ -181,7 +188,7 @@ func Run(args []string, version string) error {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
 	binDst := filepath.Join(home, ".local", "bin", "hospital-sidecar")
-	if err := copyFile(exe, binDst, 0755); err != nil {
+	if err := installExecutable(exe, binDst, 0755); err != nil {
 		return fmt.Errorf("install binary: %w", err)
 	}
 	fmt.Printf("  Installed binary: %s\n", binDst)
@@ -200,10 +207,6 @@ func Run(args []string, version string) error {
 		return fmt.Errorf("write env file: %w", err)
 	}
 	fmt.Printf("  Wrote config: %s\n", envPath)
-
-	// --- Stop old service if exists ---
-	_ = runCmd("systemctl", "--user", "stop", oldService)
-	_ = runCmd("systemctl", "--user", "disable", oldService)
 
 	// --- Enable linger ---
 	_ = runCmd("loginctl", "enable-linger")
@@ -398,7 +401,7 @@ func buildEnvFile(cfg *setupConfig, llmURL, llmAuth, authMethod, privateKeyPath,
 	return b.String()
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
+func installExecutable(src, dst string, mode os.FileMode) error {
 	// If src == dst, skip
 	srcAbs, _ := filepath.Abs(src)
 	dstAbs, _ := filepath.Abs(dst)
@@ -406,22 +409,40 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return nil
 	}
 
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".hospital-sidecar-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	return out.Close()
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func runCmd(name string, args ...string) error {
