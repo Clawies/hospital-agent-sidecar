@@ -116,14 +116,30 @@ func Run(args []string, version string) error {
 		}
 	}
 
-	// --- Ed25519 registration (if --host-token provided) ---
+	// --- Registration ---
 	var authMethod string
 	var privateKeyPath string
 	var fingerprint string
 
-	if cfg.hostToken != "" {
+	if cfg.apiKey != "" {
+		// Legacy API key auth -- no registration needed
+		authMethod = "api_key"
+	} else {
+		// Ed25519 registration (default path)
 		authMethod = "ed25519"
-		fmt.Println("\n  Generating Ed25519 keypair...")
+
+		// Auto-register host if no --host-token provided
+		if cfg.hostToken == "" {
+			fmt.Printf("\n  Auto-registering host with %s...\n", cfg.hospitalURL)
+			hostResp, err := RegisterHost(cfg.hospitalURL, cfg.name)
+			if err != nil {
+				return fmt.Errorf("host auto-registration failed: %w", err)
+			}
+			cfg.hostToken = hostResp.EnrollmentToken
+			fmt.Printf("  Host registered: %s\n", hostResp.HostID[:8]+"...")
+		}
+
+		fmt.Println("  Generating Ed25519 keypair...")
 
 		pub, priv, err := identity.GenerateKeypair()
 		if err != nil {
@@ -139,8 +155,8 @@ func Run(args []string, version string) error {
 		fingerprint = identity.PublicKeyFingerprint(pub)
 		fmt.Printf("  Fingerprint: %s\n", fingerprint[:16]+"...")
 
-		// Register with hospital
-		fmt.Printf("  Registering with %s...\n", cfg.hospitalURL)
+		// Register agent with hospital
+		fmt.Printf("  Registering agent with %s...\n", cfg.hospitalURL)
 		regResp, err := RegisterAgent(cfg.hospitalURL, RegisterRequest{
 			HostToken:   cfg.hostToken,
 			PublicKey:   identity.PublicKeyBase64(pub),
@@ -155,8 +171,6 @@ func Run(args []string, version string) error {
 		cfg.inboundToken = regResp.InboundToken
 		fmt.Printf("  Registered: agentId=%s\n", regResp.AgentID)
 		fmt.Printf("  Capabilities: %s\n", strings.Join(regResp.Capabilities, ", "))
-	} else {
-		authMethod = "api_key"
 	}
 
 	// --- Create directories ---
@@ -248,7 +262,7 @@ func Run(args []string, version string) error {
 	if authMethod == "ed25519" {
 		fmt.Println("Agent registered with Ed25519 keypair authentication.")
 	} else {
-		fmt.Println("The sidecar will auto-register with Agent Hospital on the first heartbeat.")
+		fmt.Println("Using legacy API key authentication.")
 	}
 	fmt.Println("Check logs: journalctl --user -u hospital-sidecar -f")
 
@@ -324,10 +338,13 @@ func parseFlags(args []string) (*setupConfig, error) {
 			i++
 			cfg.name = args[i]
 		case "--help", "-h":
-			fmt.Println("Usage: hospital-sidecar setup [--host-token TOKEN | --api-key KEY] --hospital-url URL [options]")
+			fmt.Println("Usage: hospital-sidecar setup --hospital-url URL [options]")
 			fmt.Println()
-			fmt.Println("Authentication (pick one):")
-			fmt.Println("  --host-token TOKEN   Register with Ed25519 keypair (recommended)")
+			fmt.Println("Registers with Agent Hospital using Ed25519 keypair auth (auto-registration).")
+			fmt.Println("No tokens or API keys needed -- the sidecar auto-creates a host and registers itself.")
+			fmt.Println()
+			fmt.Println("Authentication (optional, overrides auto-registration):")
+			fmt.Println("  --host-token TOKEN   Use an existing enrollment token")
 			fmt.Println("  --api-key KEY        Use legacy API key auth")
 			fmt.Println()
 			fmt.Println("Options:")
@@ -345,9 +362,6 @@ func parseFlags(args []string) (*setupConfig, error) {
 		}
 	}
 
-	if cfg.apiKey == "" && cfg.hostToken == "" {
-		return nil, fmt.Errorf("either --host-token or --api-key is required")
-	}
 	if cfg.apiKey != "" && cfg.hostToken != "" {
 		return nil, fmt.Errorf("--host-token and --api-key are mutually exclusive")
 	}
