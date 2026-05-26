@@ -2,7 +2,7 @@ import * as os from "os";
 import { detectFramework } from "./detect.js";
 import { collectHealth } from "./health.js";
 import { collectFileContents } from "./files.js";
-import { listRepairActions, getActionCommand, executeRepair } from "./repair.js";
+import { listRepairActions, getActionCommand, executeRepair, isManualOnly, executeDeferredRepair } from "./repair.js";
 import { reasonAboutDiagnosis, reconsiderCounterArguments } from "./reason.js";
 import { loadCredentials, registerAndCache, signJWT, } from "./credentials.js";
 // ---------------------------------------------------------------------------
@@ -43,12 +43,12 @@ function parseArgs() {
     return { url, framework, json };
 }
 function printUsage() {
-    console.error("Usage: agent-hospital-client heal [hospital-url] [--framework openclaw|hermes] [--json]");
+    console.error("Usage: hospital-sidecar heal [hospital-url] [--framework openclaw|hermes] [--json]");
     console.error("");
     console.error("Examples:");
-    console.error("  npx @agent-hospital/client heal");
-    console.error("  npx @agent-hospital/client heal https://my-hospital.example.com");
-    console.error("  npx @agent-hospital/client heal --framework openclaw --json");
+    console.error("  npx @agent-hospital/sidecar heal");
+    console.error("  npx @agent-hospital/sidecar heal https://my-hospital.example.com");
+    console.error("  npx @agent-hospital/sidecar heal --framework openclaw --json");
 }
 // ---------------------------------------------------------------------------
 // HTTP helpers (native fetch, Node 18+)
@@ -116,6 +116,29 @@ function logRecommendations(commands) {
     for (const cmd of manual) {
         log(`  $ ${cmd.action}`);
         log(`    ${cmd.description}`);
+    }
+}
+// ---------------------------------------------------------------------------
+// Post-heal: execute deferred repairs (restart-daemon, kill-port-conflict)
+// These are safe to run now that the heal session is complete.
+// ---------------------------------------------------------------------------
+function runDeferredRepairs(actions, framework, json) {
+    if (actions.length === 0) return;
+    // Deduplicate
+    const unique = [...new Set(actions)];
+    if (!json) {
+        log("");
+        log(`Executing ${unique.length} deferred repair(s) (safe now that heal session is complete):`);
+    }
+    for (const action of unique) {
+        const result = executeDeferredRepair(action, framework);
+        if (!json) {
+            if (result.success) {
+                log(`  [OK]   ${action}: ${result.output}`);
+            } else {
+                log(`  [FAIL] ${action}: ${result.output}`);
+            }
+        }
     }
 }
 // ---------------------------------------------------------------------------
@@ -188,6 +211,7 @@ async function main() {
     const MAX_TURNS = 10;
     let lastDisagreements = [];
     let hasReregistered = false;
+    const deferredActions = []; // manual-only actions to execute after heal loop
     // Initial request payload
     let requestBody = {
         name: os.hostname(),
@@ -265,6 +289,7 @@ async function main() {
                 log("");
                 log(`Healing complete in ${turnCount} turn(s).`);
             }
+            runDeferredRepairs(deferredActions, framework, json);
             return;
         }
         if (decision.decision === "escalate") {
@@ -290,6 +315,7 @@ async function main() {
                 log("");
                 log("Healing failed -- manual intervention required");
             }
+            runDeferredRepairs(deferredActions, framework, json);
             process.exit(1);
         }
         if (decision.decision === "more_repairs" || decision.decision === "recheck_health") {
@@ -413,6 +439,10 @@ async function main() {
                     if (shellCmd) {
                         const result = executeRepair(cmd.action, framework);
                         results.push({ action: cmd.action, ...result });
+                        // Track deferred actions for post-heal execution
+                        if (isManualOnly(cmd.action, framework)) {
+                            deferredActions.push(cmd.action);
+                        }
                     }
                     else {
                         results.push({ action: cmd.action, success: false, output: `Unknown action: ${cmd.action}` });
@@ -478,6 +508,7 @@ async function main() {
             log("");
             log(`Reached maximum healing turns (${MAX_TURNS}). Please investigate manually.`);
         }
+        runDeferredRepairs(deferredActions, framework, json);
         process.exit(1);
     }
 }

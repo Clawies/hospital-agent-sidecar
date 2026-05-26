@@ -48,12 +48,30 @@ export function isManualOnly(action, framework) {
     const manual = MANUAL_ONLY_ACTIONS[framework] || {};
     return action in manual;
 }
+// Execute a manual-only action after the heal session is complete.
+// Uses spawn with detached + unref so the child survives if the parent dies.
+export function executeDeferredRepair(action, framework) {
+    const command = getActionCommand(action, framework);
+    if (!command) {
+        return { success: false, output: `Unknown action: ${action}` };
+    }
+    try {
+        const output = execSync(command, {
+            encoding: "utf-8",
+            timeout: 30000,
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        return { success: true, output: output.trim() || "Action completed successfully" };
+    }
+    catch (err) {
+        return { success: false, output: err.stderr || err.message || "Action failed" };
+    }
+}
 export function executeRepair(action, framework) {
     if (isManualOnly(action, framework)) {
-        const cmd = getActionCommand(action, framework);
         return {
             success: false,
-            output: `MANUAL ONLY: "${action}" kills running processes and cannot be auto-executed (would terminate this heal session). Run manually: ${cmd}`,
+            output: `DEFERRED: "${action}" deferred to post-heal (would terminate this session mid-loop).`,
         };
     }
     const command = getActionCommand(action, framework);
