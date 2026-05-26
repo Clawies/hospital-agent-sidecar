@@ -8,6 +8,13 @@ const { version } = require("../package.json");
 
 const GITHUB_REPO = "Clawies/hospital-agent-sidecar";
 
+// Skip binary download entirely (for CI/serverless where only "heal" is needed)
+if (process.env.HOSPITAL_SIDECAR_SKIP_BINARY === "1") {
+  console.log("HOSPITAL_SIDECAR_SKIP_BINARY=1 -- skipping Go binary download.");
+  console.log("The 'heal' command works without it. Setup/status/uninstall require it.");
+  process.exit(0);
+}
+
 function download(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? https : http;
@@ -78,12 +85,10 @@ async function install() {
 }
 
 install().catch((err) => {
-  console.error(`Failed to install hospital-sidecar: ${err.message}`);
-  console.error("");
-  console.error("You can manually download the binary from:");
-  console.error(`  https://github.com/${GITHUB_REPO}/releases`);
-  console.error("");
-  console.error("Then place it at:");
-  console.error(`  ${path.join(__dirname, "..", "bin", getBinaryName())}`);
-  process.exit(1);
+  // Don't fail the install -- heal command works without the binary
+  console.warn(`NOTE: Could not download hospital-sidecar binary: ${err.message}`);
+  console.warn("The 'heal' command works without it. Setup/status/uninstall require it.");
+  console.warn("");
+  console.warn("To manually download:");
+  console.warn(`  https://github.com/${GITHUB_REPO}/releases`);
 });
