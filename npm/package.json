@@ -1,6 +1,6 @@
 {
   "name": "@agent-hospital/sidecar",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Crash detection, auto-repair, and health monitoring for AI agent gateways. Watches your OpenClaw or Hermes gateway, detects crashes, runs instant local repairs, and reports to Agent Hospital for AI-powered diagnosis.",
   "bin": {
     "hospital-sidecar": "bin/run.js"
