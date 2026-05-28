@@ -30,6 +30,14 @@ export const MANUAL_ONLY_ACTIONS = {
     },
 };
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+const MAX_OUTPUT = 9500; // Server validates at 10000; leave margin
+function cap(s) {
+    if (typeof s !== "string") return "";
+    return s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + "\n[truncated]" : s;
+}
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 export function listRepairActions(framework) {
@@ -61,10 +69,10 @@ export function executeDeferredRepair(action, framework) {
             timeout: 30000,
             stdio: ["pipe", "pipe", "pipe"],
         });
-        return { success: true, output: output.trim() || "Action completed successfully" };
+        return { success: true, output: cap(output.trim() || "Action completed successfully") };
     }
     catch (err) {
-        return { success: false, output: err.stderr || err.message || "Action failed" };
+        return { success: false, output: cap(err.stderr || err.message || "Action failed") };
     }
 }
 export function executeRepair(action, framework) {
@@ -84,9 +92,9 @@ export function executeRepair(action, framework) {
             timeout: 30000,
             stdio: ["pipe", "pipe", "pipe"],
         });
-        return { success: true, output: output.trim() || "Action completed successfully" };
+        return { success: true, output: cap(output.trim() || "Action completed successfully") };
     }
     catch (err) {
-        return { success: false, output: err.stderr || err.message || "Action failed" };
+        return { success: false, output: cap(err.stderr || err.message || "Action failed") };
     }
 }
