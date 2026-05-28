@@ -32,10 +32,17 @@ export const MANUAL_ONLY_ACTIONS = {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const MAX_OUTPUT = 9500; // Server validates at 10000; leave margin
-function cap(s) {
-    if (typeof s !== "string") return "";
-    return s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + "\n[truncated]" : s;
+// Summarize find-style output: "Deleted 42 files" instead of 42 raw paths
+function summarize(raw, action) {
+    if (typeof raw !== "string") return "";
+    const trimmed = raw.trim();
+    if (!trimmed) return "No files matched";
+    const lines = trimmed.split("\n").filter(Boolean);
+    if (lines.length <= 5) return trimmed; // Short output -- keep as-is
+    // Summarize: count + first 3 + last 1
+    const head = lines.slice(0, 3).join("\n");
+    const tail = lines[lines.length - 1];
+    return `${lines.length} files affected:\n${head}\n  ... (${lines.length - 4} more)\n${tail}`;
 }
 // ---------------------------------------------------------------------------
 // Public API
@@ -69,10 +76,11 @@ export function executeDeferredRepair(action, framework) {
             timeout: 30000,
             stdio: ["pipe", "pipe", "pipe"],
         });
-        return { success: true, output: cap(output.trim() || "Action completed successfully") };
+        return { success: true, output: summarize(output, action) || "Action completed successfully" };
     }
     catch (err) {
-        return { success: false, output: cap(err.stderr || err.message || "Action failed") };
+        const msg = (err.stderr || err.message || "Action failed").slice(0, 2000);
+        return { success: false, output: msg };
     }
 }
 export function executeRepair(action, framework) {
@@ -92,9 +100,10 @@ export function executeRepair(action, framework) {
             timeout: 30000,
             stdio: ["pipe", "pipe", "pipe"],
         });
-        return { success: true, output: cap(output.trim() || "Action completed successfully") };
+        return { success: true, output: summarize(output, action) || "Action completed successfully" };
     }
     catch (err) {
-        return { success: false, output: cap(err.stderr || err.message || "Action failed") };
+        const msg = (err.stderr || err.message || "Action failed").slice(0, 2000);
+        return { success: false, output: msg };
     }
 }
